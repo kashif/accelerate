@@ -2499,12 +2499,18 @@ class Accelerator:
         self._schedulers.append(scheduler)
         return scheduler
 
-    def backward(self, loss, **kwargs):
+    def backward(self, loss, is_final_micro_batch=None, **kwargs):
         """
         Scales the gradients in accordance to the `GradientAccumulationPlugin` and calls the correct `backward()` based
         on the configuration.
 
         Should be used in lieu of `loss.backward()`.
+
+        Args:
+            loss: The loss tensor to backpropagate.
+            is_final_micro_batch (bool, optional): For DeepSpeed, indicates whether this is the final
+                micro-batch in gradient accumulation. If None, will use sync_gradients to determine.
+            **kwargs: Additional keyword arguments passed to the backward function.
 
         Example:
 
@@ -2516,6 +2522,15 @@ class Accelerator:
         >>> loss = loss_fn(outputs, labels)
         >>> accelerator.backward(loss)
         ```
+
+        For DeepSpeed with manual gradient accumulation control:
+
+        ```python
+        >>> for i, batch in enumerate(micro_batches):
+        ...     is_final = (i == len(micro_batches) - 1)
+        ...     loss = model(batch)
+        ...     accelerator.backward(loss, is_final_micro_batch=is_final)
+        ```
         """
         learning_rate = kwargs.get("learning_rate")
 
@@ -2523,6 +2538,12 @@ class Accelerator:
             # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
             loss = loss / self.gradient_accumulation_steps
         if self.distributed_type == DistributedType.DEEPSPEED:
+            # For DeepSpeed, set gradient accumulation boundary before backward
+            if is_final_micro_batch is not None:
+                self.deepspeed_engine_wrapped.set_gradient_accumulation_boundary(is_final_micro_batch)
+            else:
+                # Use sync_gradients as fallback (existing behavior)
+                self.deepspeed_engine_wrapped.set_gradient_accumulation_boundary(self.sync_gradients)
             self.deepspeed_engine_wrapped.backward(loss, **kwargs)
         elif self.distributed_type == DistributedType.MEGATRON_LM:
             return
@@ -2532,6 +2553,142 @@ class Accelerator:
             self.lomo_backward(loss, learning_rate)
         else:
             loss.backward(**kwargs)
+
+    def set_deepspeed_gradient_accumulation_boundary(self, is_boundary):
+        """
+        Set the gradient accumulation boundary for DeepSpeed engines.
+
+        This method allows fine-grained control over when DeepSpeed performs optimizer steps,
+        gradient clipping, and other end-of-accumulation operations.
+
+        Args:
+            is_boundary (bool): Whether the next backward pass should trigger gradient accumulation boundary
+
+        Example:
+
+        ```python
+        >>> accelerator = Accelerator()
+        >>> # Manual gradient accumulation with DeepSpeed
+        >>> for i, batch in enumerate(micro_batches):
+        ...     is_final = (i == len(micro_batches) - 1)
+        ...     accelerator.set_deepspeed_gradient_accumulation_boundary(is_final)
+        ...     loss = model(batch)
+        ...     accelerator.backward(loss)
+        ```
+
+        Note:
+            This method only has an effect when using DeepSpeed. For other distributed types,
+            it will be ignored.
+        """
+        if self.distributed_type == DistributedType.DEEPSPEED and self.deepspeed_engine_wrapped is not None:
+            self.deepspeed_engine_wrapped.set_gradient_accumulation_boundary(is_boundary)
+
+    def optimizer_step_and_zero_grad(self, optimizer=None, model=None, max_grad_norm=None):
+        """
+        Perform optimizer step and zero gradients with unified handling for DeepSpeed and standard training.
+        
+        This method provides a unified interface for optimizer stepping that works seamlessly with both
+        DeepSpeed and standard PyTorch training, handling gradient clipping and gradient norm computation
+        appropriately for each backend.
+        
+        Args:
+            optimizer (`torch.optim.Optimizer`, *optional*): 
+                The optimizer to step. Only used for non-DeepSpeed training. If not provided,
+                will use the first optimizer from those passed to `prepare()`.
+            model (`torch.nn.Module`, *optional*):
+                The model being trained. Only used for DeepSpeed training. If not provided,
+                will use the first model from those passed to `prepare()`.
+            max_grad_norm (`float`, *optional*):
+                Maximum gradient norm for clipping. If provided, gradients will be clipped
+                before the optimizer step.
+        
+        Returns:
+            `float`: The global gradient norm. For DeepSpeed, returns the computed gradient norm
+            if available, otherwise -1.0. For standard training, returns the gradient norm
+            from clipping if `max_grad_norm` is provided, otherwise None.
+        
+        Example:
+        
+        ```python
+        >>> accelerator = Accelerator()
+        >>> model, optimizer = accelerator.prepare(model, optimizer)
+        >>> 
+        >>> # Works with both DeepSpeed and standard training
+        >>> for batch in dataloader:
+        ...     with accelerator.accumulate(model):
+        ...         loss = model(batch)
+        ...         accelerator.backward(loss)
+        ...         if accelerator.sync_gradients:
+        ...             grad_norm = accelerator.optimizer_step_and_zero_grad(
+        ...                 optimizer=optimizer, 
+        ...                 model=model, 
+        ...                 max_grad_norm=1.0
+        ...             )
+        ```
+        """
+        if self.distributed_type == DistributedType.DEEPSPEED:
+            # Use the provided model or default to the first prepared model
+            target_model = model if model is not None else (self._models[0] if self._models else None)
+            
+            if target_model is None:
+                raise ValueError(
+                    "No model provided and no models found in prepared models. "
+                    "Please provide a model or ensure you've called accelerator.prepare(model, ...)."
+                )
+            
+            # Set final boundary before optimizer step for DeepSpeed
+            if hasattr(target_model, "set_gradient_accumulation_boundary"):
+                target_model.set_gradient_accumulation_boundary(True)
+            
+            # DeepSpeed handles optimizer step internally
+            if hasattr(target_model, "step"):
+                target_model.step()
+            
+            # Get gradient norm from DeepSpeed if available
+            grad_norm = None
+            if hasattr(target_model, "get_global_grad_norm"):
+                grad_norm = target_model.get_global_grad_norm()
+                if isinstance(grad_norm, torch.Tensor):
+                    grad_norm = grad_norm.item()
+            
+            return grad_norm if grad_norm is not None else -1.0
+            
+        else:
+            # Standard PyTorch training
+            # Use the provided optimizer or default to the first prepared optimizer
+            target_optimizer = optimizer if optimizer is not None else (self._optimizers[0] if self._optimizers else None)
+            
+            if target_optimizer is None:
+                raise ValueError(
+                    "No optimizer provided and no optimizers found in prepared optimizers. "
+                    "Please provide an optimizer or ensure you've called accelerator.prepare(..., optimizer)."
+                )
+            
+            # Unwrap AcceleratedOptimizer if needed
+            while isinstance(target_optimizer, AcceleratedOptimizer):
+                target_optimizer = target_optimizer.optimizer
+            
+            grad_norm = None
+            
+            # Clip gradients if max_grad_norm is provided
+            if max_grad_norm is not None:
+                # Get model parameters for gradient clipping
+                if model is not None:
+                    parameters = model.parameters()
+                elif self._models:
+                    parameters = self._models[0].parameters()
+                else:
+                    raise ValueError(
+                        "Cannot perform gradient clipping: no model provided and no models found in prepared models."
+                    )
+                
+                grad_norm = self.clip_grad_norm_(parameters, max_grad_norm)
+            
+            # Perform optimizer step and zero gradients
+            target_optimizer.step()
+            target_optimizer.zero_grad()
+            
+            return grad_norm
 
     def set_trigger(self):
         """

@@ -260,19 +260,37 @@ class DeepSpeedEngineWrapper:
 
     def __init__(self, engine):
         self.engine = engine
+        self._gradient_accumulation_boundary = True  # Default to True for backward compatibility
+
+    def set_gradient_accumulation_boundary(self, is_boundary):
+        """
+        Set whether the next backward pass is at a gradient accumulation boundary.
+
+        This controls whether DeepSpeed will perform optimizer step, gradient clipping,
+        and other end-of-accumulation operations.
+
+        Args:
+            is_boundary (bool): Whether this is the final micro-batch in gradient accumulation
+        """
+        self._gradient_accumulation_boundary = is_boundary
+        # Forward to DeepSpeed's method if available
+        if hasattr(self.engine, "set_gradient_accumulation_boundary"):
+            self.engine.set_gradient_accumulation_boundary(is_boundary)
 
     def backward(self, loss, **kwargs):
         # runs backpropagation and handles mixed precision
         self.engine.backward(loss, **kwargs)
 
-        # Deepspeed's `engine.step` performs the following operations:
-        # - gradient accumulation check
-        # - gradient clipping
-        # - optimizer step
-        # - zero grad
-        # - checking overflow
-        # - lr_scheduler step (only if engine.lr_scheduler is not None)
-        self.engine.step()
+        # Only perform step operations if we're at a gradient accumulation boundary
+        if self._gradient_accumulation_boundary:
+            # Deepspeed's `engine.step` performs the following operations:
+            # - gradient accumulation check
+            # - gradient clipping
+            # - optimizer step
+            # - zero grad
+            # - checking overflow
+            # - lr_scheduler step (only if engine.lr_scheduler is not None)
+            self.engine.step()
         # and this plugin overrides the above calls with no-ops when Accelerate runs under
         # Deepspeed, but allows normal functionality for non-Deepspeed cases thus enabling a simple
         # training loop that works transparently under many training regimes.
