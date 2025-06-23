@@ -2842,6 +2842,28 @@ class TorchTitanPlugin:
             Whether to compile the model using torch.compile.
         compile_config (`dict`, defaults to `None`):
             Configuration for torch.compile (backend, mode, etc.).
+        enable_checkpoint (`bool`, defaults to `True`):
+            Whether to enable checkpointing functionality.
+        checkpoint_folder (`str`, defaults to `"checkpoints"`):
+            Directory to save checkpoints.
+        checkpoint_interval (`int`, defaults to `1000`):
+            Number of steps between checkpoints.
+        checkpoint_async_mode (`str`, defaults to `"disabled"`):
+            Async checkpointing mode. Options: "disabled", "async", "async_with_pinned_mem".
+        checkpoint_keep_latest_k (`int`, defaults to `2`):
+            Number of latest checkpoints to keep.
+        checkpoint_enable_first_step (`bool`, defaults to `False`):
+            Whether to save checkpoint at first step.
+        checkpoint_export_dtype (`str`, defaults to `"float32"`):
+            Data type to export checkpoints in.
+        checkpoint_model_weights_only_at_end (`bool`, defaults to `False`):
+            Whether to save only model weights at the end of training.
+        checkpoint_exclude_from_loading (`list`, defaults to `None`):
+            List of keys to exclude when loading checkpoints.
+        checkpoint_initial_load_path (`str`, defaults to `None`):
+            Path to initial checkpoint to load.
+        checkpoint_initial_load_model_weights_only (`bool`, defaults to `False`):
+            Whether to load only model weights from initial checkpoint.
     """
 
     job_config: Optional[Union[str, dict]] = None
@@ -2866,6 +2888,19 @@ class TorchTitanPlugin:
     # Compilation
     compile_model: bool = False
     compile_config: Optional[dict] = None
+
+    # Checkpointing configuration
+    enable_checkpoint: bool = True
+    checkpoint_folder: str = "checkpoints"
+    checkpoint_interval: int = 1000
+    checkpoint_async_mode: str = "disabled"  # "disabled", "async", "async_with_pinned_mem"
+    checkpoint_keep_latest_k: int = 2
+    checkpoint_enable_first_step: bool = False
+    checkpoint_export_dtype: str = "float32"
+    checkpoint_model_weights_only_at_end: bool = False
+    checkpoint_exclude_from_loading: Optional[list[str]] = None
+    checkpoint_initial_load_path: Optional[str] = None
+    checkpoint_initial_load_model_weights_only: bool = False
 
     def __post_init__(self):
         # Validate parallelism degrees

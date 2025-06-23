@@ -2422,6 +2422,25 @@ class Accelerator:
                 else:
                     result[i] = self._prepare_one(obj, first_pass=True)
         
+        # Set up TorchTitan checkpoint manager if checkpointing is enabled
+        if plugin.enable_checkpoint:
+            # Collect prepared models, optimizers, and schedulers
+            prepared_models = [obj for obj in result if isinstance(obj, torch.nn.Module)]
+            prepared_optimizers = [obj for obj in result if isinstance(obj, torch.optim.Optimizer)]
+            prepared_schedulers = [obj for obj in result if hasattr(obj, 'step') and hasattr(obj, 'get_last_lr')]
+            
+            self._torchtitan_checkpoint_manager = self._setup_torchtitan_checkpoint_manager(
+                model_parts=prepared_models,
+                optimizers=prepared_optimizers,
+                lr_schedulers=prepared_schedulers,
+                dataloader=prepared_dataloaders[0] if prepared_dataloaders else None,
+                plugin=plugin
+            )
+            
+            # Try to load existing checkpoint
+            if self._torchtitan_checkpoint_manager:
+                self.load_torchtitan_checkpoint()
+
         logger.info("TorchTitan preparation completed successfully")
         return tuple(result)
     
@@ -2858,31 +2877,47 @@ class Accelerator:
             return scheduler
     
     def _setup_torchtitan_distributed_dataloader(self, dataloader, dp_size, device_mesh):
-        """Configure dataloader for distributed training with proper sharding."""
-        from accelerate.logging import get_logger
-        logger = get_logger(__name__)
+        """
+        Set up distributed dataloader for TorchTitan with proper data parallelism.
         
+        Args:
+            dataloader: The dataloader to distribute
+            dp_size: Data parallelism size
+            device_mesh: The device mesh for distributed training
+            
+        Returns:
+            Distributed dataloader
+        """
         try:
-            logger.info(f"Configuring dataloader for distributed training with DP size: {dp_size}")
+            import torch.distributed as dist
+            from torch.utils.data.distributed import DistributedSampler
             
-            # For multi-dimensional parallelism, we need to ensure data is properly sharded
-            # across the data parallel dimension only (not TP or PP)
+            # Create distributed sampler if not already present
+            if not isinstance(dataloader.sampler, DistributedSampler):
+                sampler = DistributedSampler(
+                    dataloader.dataset,
+                    num_replicas=dp_size,
+                    rank=dist.get_rank() % dp_size,
+                    shuffle=True
+                )
+                
+                # Create new dataloader with distributed sampler
+                from torch.utils.data import DataLoader
+                distributed_dataloader = DataLoader(
+                    dataset=dataloader.dataset,
+                    batch_size=dataloader.batch_size,
+                    sampler=sampler,
+                    num_workers=dataloader.num_workers,
+                    collate_fn=dataloader.collate_fn,
+                    pin_memory=dataloader.pin_memory,
+                    drop_last=dataloader.drop_last
+                )
+                return distributed_dataloader
             
-            if dp_size > 1:
-                logger.info(f"Setting up data sharding for DP size: {dp_size}")
-                
-                # Use the existing _prepare_one method which handles distributed sampling
-                # This will automatically set up DistributedSampler for data parallelism
-                prepared_dataloader = self._prepare_one(dataloader, first_pass=True)
-                
-                logger.info("Successfully configured distributed dataloader")
-                return prepared_dataloader
-            else:
-                logger.info("DP size = 1, using standard dataloader")
-                return dataloader
-                
-        except Exception as e:
-            logger.warning(f"Failed to configure distributed dataloader: {e}. Using standard dataloader.")
+            return dataloader
+            
+        except ImportError as e:
+            logger.warning(f"Failed to set up TorchTitan distributed dataloader: {e}")
             return dataloader
 
     def _prepare_ipex(self, *args):
@@ -4600,3 +4635,238 @@ class Accelerator:
         elif self.state.deepspeed_plugin is not None and self.state.deepspeed_plugin.enable_msamp:
             return "MSAMP"
         return None
+
+    def _setup_torchtitan_checkpoint_manager(self, model_parts, optimizers, lr_schedulers, dataloader, plugin):
+        """
+        Set up TorchTitan's advanced checkpointing system.
+        
+        Args:
+            model_parts: List of model parts for pipeline parallelism
+            optimizers: Container of optimizers
+            lr_schedulers: Container of LR schedulers
+            dataloader: Training dataloader
+            plugin: TorchTitanPlugin configuration
+            
+        Returns:
+            TorchTitan CheckpointManager instance
+        """
+        try:
+            # Import TorchTitan checkpointing components
+            from torchtitan.components.checkpoint import CheckpointManager, AsyncMode
+            import torch.distributed as dist
+            import os
+            
+            # Create training state container
+            class TrainState:
+                def __init__(self):
+                    self.step = 0
+                    
+                def state_dict(self):
+                    return {"step": self.step}
+                    
+                def load_state_dict(self, state_dict):
+                    self.step = state_dict.get("step", 0)
+            
+            train_state = TrainState()
+            
+            # Create states dictionary for checkpointing
+            states = {
+                "train_state": train_state,
+            }
+            
+            # Create job config for checkpoint manager
+            class JobConfig:
+                def __init__(self, plugin):
+                    self.checkpoint = self._create_checkpoint_config(plugin)
+                    self.job = self._create_job_config()
+                    self.fault_tolerance = self._create_ft_config()
+                    
+                def _create_checkpoint_config(self, plugin):
+                    class CheckpointConfig:
+                        def __init__(self, plugin):
+                            self.enable_checkpoint = plugin.enable_checkpoint
+                            self.folder = plugin.checkpoint_folder
+                            self.interval = plugin.checkpoint_interval
+                            self.async_mode = plugin.checkpoint_async_mode
+                            self.keep_latest_k = plugin.checkpoint_keep_latest_k
+                            self.enable_first_step_checkpoint = plugin.checkpoint_enable_first_step
+                            self.export_dtype = plugin.checkpoint_export_dtype
+                            self.last_save_model_weights_only = plugin.checkpoint_model_weights_only_at_end
+                            self.exclude_from_loading = plugin.checkpoint_exclude_from_loading or []
+                            self.initial_load_path = plugin.checkpoint_initial_load_path
+                            self.initial_load_model_weights_only = plugin.checkpoint_initial_load_model_weights_only
+                    return CheckpointConfig(plugin)
+                    
+                def _create_job_config(self):
+                    class JobConfigInner:
+                        def __init__(self):
+                            self.dump_folder = "."
+                    return JobConfigInner()
+                    
+                def _create_ft_config(self):
+                    class FTConfig:
+                        def __init__(self):
+                            self.replica_id = 0
+                    return FTConfig()
+            
+            job_config = JobConfig(plugin)
+            
+            # Create fault tolerance manager (disabled for now)
+            class FTManager:
+                def __init__(self):
+                    self.enabled = False
+                    self.manager = None
+            
+            ft_manager = FTManager()
+            
+            # Create optimizers container
+            class OptimizersContainer:
+                def __init__(self, optimizers):
+                    self._optimizers = optimizers if isinstance(optimizers, list) else [optimizers]
+                    
+                def state_dict(self):
+                    if len(self._optimizers) == 1:
+                        return self._optimizers[0].state_dict()
+                    return {f"optimizer_{i}": opt.state_dict() for i, opt in enumerate(self._optimizers)}
+                    
+                def load_state_dict(self, state_dict):
+                    if len(self._optimizers) == 1:
+                        self._optimizers[0].load_state_dict(state_dict)
+                    else:
+                        for i, opt in enumerate(self._optimizers):
+                            opt.load_state_dict(state_dict[f"optimizer_{i}"])
+                            
+                def init_cache_state_dict(self):
+                    # For fault tolerance - not implemented yet
+                    pass
+            
+            # Create LR schedulers container
+            class LRSchedulersContainer:
+                def __init__(self, schedulers):
+                    self._schedulers = schedulers if isinstance(schedulers, list) else [schedulers]
+                    
+                def state_dict(self):
+                    if len(self._schedulers) == 1:
+                        return self._schedulers[0].state_dict()
+                    return {f"scheduler_{i}": sched.state_dict() for i, sched in enumerate(self._schedulers)}
+                    
+                def load_state_dict(self, state_dict):
+                    if len(self._schedulers) == 1:
+                        self._schedulers[0].load_state_dict(state_dict)
+                    else:
+                        for i, sched in enumerate(self._schedulers):
+                            sched.load_state_dict(state_dict[f"scheduler_{i}"])
+            
+            optimizers_container = OptimizersContainer(optimizers)
+            lr_schedulers_container = LRSchedulersContainer(lr_schedulers)
+            
+            # Initialize checkpoint manager
+            checkpoint_manager = CheckpointManager(
+                dataloader=dataloader,
+                model_parts=model_parts if isinstance(model_parts, list) else [model_parts],
+                optimizers=optimizers_container,
+                lr_schedulers=lr_schedulers_container,
+                states=states,
+                job_config=job_config,
+                ft_manager=ft_manager
+            )
+            
+            logger.info(f"TorchTitan CheckpointManager initialized with folder: {plugin.checkpoint_folder}")
+            return checkpoint_manager
+            
+        except ImportError as e:
+            logger.warning(f"TorchTitan checkpointing not available: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to initialize TorchTitan CheckpointManager: {e}")
+            return None
+
+    def save_torchtitan_checkpoint(self, step: int, force: bool = False):
+        """
+        Save a checkpoint using TorchTitan's checkpointing system.
+        
+        Args:
+            step (int): Current training step
+            force (bool): Whether to force save regardless of interval
+        """
+        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+            try:
+                # Update training state
+                if hasattr(self._torchtitan_checkpoint_manager, 'states') and 'train_state' in self._torchtitan_checkpoint_manager.states:
+                    self._torchtitan_checkpoint_manager.states['train_state'].step = step
+                
+                # Save checkpoint
+                self._torchtitan_checkpoint_manager.save(step, force=force)
+                logger.info(f"TorchTitan checkpoint saved at step {step}")
+                
+            except Exception as e:
+                logger.error(f"Failed to save TorchTitan checkpoint: {e}")
+        else:
+            logger.warning("TorchTitan checkpoint manager not initialized")
+
+    def load_torchtitan_checkpoint(self, step: int = -1) -> bool:
+        """
+        Load a checkpoint using TorchTitan's checkpointing system.
+        
+        Args:
+            step (int): Step to load (-1 for latest)
+            
+        Returns:
+            bool: Whether checkpoint was loaded successfully
+        """
+        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+            try:
+                success = self._torchtitan_checkpoint_manager.load(step=step)
+                if success:
+                    # Get loaded training state
+                    if hasattr(self._torchtitan_checkpoint_manager, 'states') and 'train_state' in self._torchtitan_checkpoint_manager.states:
+                        loaded_step = self._torchtitan_checkpoint_manager.states['train_state'].step
+                        logger.info(f"TorchTitan checkpoint loaded from step {loaded_step}")
+                    else:
+                        logger.info("TorchTitan checkpoint loaded successfully")
+                else:
+                    logger.info("No TorchTitan checkpoint found to load")
+                return success
+                
+            except Exception as e:
+                logger.error(f"Failed to load TorchTitan checkpoint: {e}")
+                return False
+        else:
+            logger.warning("TorchTitan checkpoint manager not initialized")
+            return False
+
+    def get_torchtitan_checkpoint_step(self) -> int:
+        """
+        Get the current training step from TorchTitan checkpoint manager.
+        
+        Returns:
+            int: Current training step
+        """
+        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+            try:
+                if hasattr(self._torchtitan_checkpoint_manager, 'states') and 'train_state' in self._torchtitan_checkpoint_manager.states:
+                    return self._torchtitan_checkpoint_manager.states['train_state'].step
+            except Exception as e:
+                logger.warning(f"Failed to get TorchTitan checkpoint step: {e}")
+        return 0
+
+    def torchtitan_checkpoint_wait_for_staging(self):
+        """
+        Wait for TorchTitan checkpoint staging to complete (for async checkpointing).
+        """
+        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+            try:
+                self._torchtitan_checkpoint_manager.maybe_wait_for_staging()
+            except Exception as e:
+                logger.warning(f"Failed to wait for TorchTitan checkpoint staging: {e}")
+
+    def close_torchtitan_checkpoint_manager(self):
+        """
+        Properly close the TorchTitan checkpoint manager and cleanup resources.
+        """
+        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+            try:
+                self._torchtitan_checkpoint_manager.close()
+                logger.info("TorchTitan checkpoint manager closed")
+            except Exception as e:
+                logger.warning(f"Failed to close TorchTitan checkpoint manager: {e}")
