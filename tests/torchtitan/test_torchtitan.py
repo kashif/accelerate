@@ -26,12 +26,16 @@ from accelerate.utils import DistributedType, TorchTitanPlugin
 
 
 class SimpleModel(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_size=64):
         super().__init__()
-        self.linear = nn.Linear(10, 2)
-
+        self.linear1 = nn.Linear(hidden_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, 10)
+        
     def forward(self, x):
-        return self.linear(x)
+        x = torch.relu(self.linear1(x))
+        x = torch.relu(self.linear2(x))
+        return self.linear3(x)
 
 
 class TorchTitanIntegrationTest(unittest.TestCase):
@@ -262,6 +266,444 @@ class TorchTitanIntegrationTest(unittest.TestCase):
         # Check that preparation worked with mixed precision
         self.assertIsNotNone(prepared_model)
         self.assertEqual(accelerator.mixed_precision, "fp16")
+
+
+class TestTorchTitanSharding(unittest.TestCase):
+    def setUp(self):
+        """Clean up state before each test."""
+        AcceleratorState._reset_state()
+
+    def tearDown(self):
+        """Clean up state after each test."""
+        AcceleratorState._reset_state()
+
+    def test_plugin_basic_parallelism_config(self):
+        """Test basic parallelism configuration in TorchTitanPlugin."""
+        plugin = TorchTitanPlugin(
+            tp_degree=2,
+            pp_degree=2,
+            dp_degree=1
+        )
+        
+        self.assertEqual(plugin.tp_degree, 2)
+        self.assertEqual(plugin.pp_degree, 2) 
+        self.assertEqual(plugin.dp_degree, 1)
+        self.assertEqual(plugin.get_world_size_requirements(), 4)
+
+    def test_plugin_auto_dp_calculation(self):
+        """Test automatic data parallelism degree calculation."""
+        plugin = TorchTitanPlugin(
+            tp_degree=2,
+            pp_degree=2,
+            dp_degree=None  # Should be auto-calculated
+        )
+        
+        # Test with world size 8 (should give dp_degree=2)  
+        plugin.validate_world_size(8)
+        self.assertEqual(plugin.dp_degree, 2)
+        
+        # Test with world size 4 (should give dp_degree=1)
+        plugin = TorchTitanPlugin(tp_degree=2, pp_degree=2, dp_degree=None)
+        plugin.validate_world_size(4)
+        self.assertEqual(plugin.dp_degree, 1)
+
+    def test_plugin_world_size_validation_exact(self):
+        """Test world size validation with exact dp_degree."""
+        plugin = TorchTitanPlugin(tp_degree=2, pp_degree=2, dp_degree=2)
+        
+        # Should work with exact world size
+        plugin.validate_world_size(8)
+        
+        # Should fail with wrong world size
+        with self.assertRaises(ValueError):
+            plugin.validate_world_size(6)
+
+    def test_plugin_world_size_validation_auto(self):
+        """Test world size validation with auto dp_degree."""
+        plugin = TorchTitanPlugin(tp_degree=2, pp_degree=2, dp_degree=None)
+        
+        # Should work with divisible world sizes
+        plugin.validate_world_size(4)
+        plugin.validate_world_size(8)
+        plugin.validate_world_size(12)
+        
+        # Should fail with non-divisible world size
+        with self.assertRaises(ValueError):
+            plugin.validate_world_size(5)
+
+    def test_plugin_fsdp_configuration(self):
+        """Test FSDP configuration options."""
+        plugin = TorchTitanPlugin(
+            enable_fsdp=True,
+            fsdp_sharding_strategy="FULL_SHARD",
+            fsdp_backward_prefetch="BACKWARD_PRE",
+            fsdp_cpu_offload=True,
+            fsdp_mixed_precision_policy={"param": "fp16", "reduce": "fp32"}
+        )
+        
+        self.assertTrue(plugin.enable_fsdp)
+        self.assertEqual(plugin.fsdp_sharding_strategy, "FULL_SHARD")
+        self.assertEqual(plugin.fsdp_backward_prefetch, "BACKWARD_PRE")
+        self.assertTrue(plugin.fsdp_cpu_offload)
+        
+        fsdp_config = plugin.get_fsdp_config()
+        self.assertEqual(fsdp_config["sharding_strategy"], "FULL_SHARD")
+        self.assertEqual(fsdp_config["backward_prefetch"], "BACKWARD_PRE")
+        self.assertTrue(fsdp_config["cpu_offload"])
+        self.assertEqual(fsdp_config["mixed_precision_policy"]["param"], "fp16")
+
+    def test_plugin_invalid_fsdp_strategy(self):
+        """Test invalid FSDP sharding strategy raises error."""
+        with self.assertRaises(ValueError):
+            TorchTitanPlugin(
+                enable_fsdp=True,
+                fsdp_sharding_strategy="INVALID_STRATEGY"
+            )
+
+    def test_plugin_invalid_fsdp_prefetch(self):
+        """Test invalid FSDP backward prefetch raises error."""
+        with self.assertRaises(ValueError):
+            TorchTitanPlugin(
+                enable_fsdp=True,
+                fsdp_backward_prefetch="INVALID_PREFETCH"
+            )
+
+    def test_plugin_activation_checkpointing_config(self):
+        """Test activation checkpointing configuration."""
+        plugin = TorchTitanPlugin(
+            activation_checkpointing=True,
+            selective_checkpointing_layers=["attention", "mlp"]
+        )
+        
+        self.assertTrue(plugin.activation_checkpointing)
+        self.assertEqual(plugin.selective_checkpointing_layers, ["attention", "mlp"])
+        
+        checkpointing_config = plugin.get_checkpointing_config()
+        self.assertTrue(checkpointing_config["enabled"])
+        self.assertEqual(checkpointing_config["selective_layers"], ["attention", "mlp"])
+
+    def test_plugin_compilation_config(self):
+        """Test model compilation configuration."""
+        plugin = TorchTitanPlugin(
+            compile_model=True,
+            compile_config={
+                "backend": "inductor",
+                "mode": "max-autotune",
+                "fullgraph": True
+            }
+        )
+        
+        self.assertTrue(plugin.compile_model)
+        self.assertEqual(plugin.compile_config["backend"], "inductor")
+        self.assertEqual(plugin.compile_config["mode"], "max-autotune")
+        self.assertTrue(plugin.compile_config["fullgraph"])
+
+    def test_plugin_environment_variables(self):
+        """Test plugin configuration via environment variables."""
+        with patch.dict(os.environ, {
+            "TORCHTITAN_TP_DEGREE": "4",
+            "TORCHTITAN_PP_DEGREE": "2", 
+            "TORCHTITAN_ENABLE_FSDP": "true",
+            "TORCHTITAN_ACTIVATION_CHECKPOINTING": "true",
+            "TORCHTITAN_COMPILE_MODEL": "true"
+        }):
+            plugin = TorchTitanPlugin()
+            
+            self.assertEqual(plugin.tp_degree, 4)
+            self.assertEqual(plugin.pp_degree, 2)
+            self.assertTrue(plugin.enable_fsdp)
+            self.assertTrue(plugin.activation_checkpointing)
+            self.assertTrue(plugin.compile_model)
+
+    def test_accelerator_with_sharding_plugin(self):
+        """Test Accelerator initialization with comprehensive sharding configuration."""
+        plugin = TorchTitanPlugin(
+            tp_degree=2,
+            pp_degree=1,
+            enable_fsdp=True,
+            fsdp_sharding_strategy="SHARD_GRAD_OP",
+            activation_checkpointing=True,
+            compile_model=True
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        
+        self.assertEqual(accelerator.distributed_type, DistributedType.TORCHTITAN)
+        self.assertEqual(accelerator.state.torchtitan_plugin.tp_degree, 2)
+        self.assertEqual(accelerator.state.torchtitan_plugin.pp_degree, 1)
+        self.assertTrue(accelerator.state.torchtitan_plugin.enable_fsdp)
+        self.assertTrue(accelerator.state.torchtitan_plugin.activation_checkpointing)
+        self.assertTrue(accelerator.state.torchtitan_plugin.compile_model)
+
+    def test_model_preparation_with_parallelism(self):
+        """Test model preparation with multi-dimensional parallelism."""
+        plugin = TorchTitanPlugin(
+            tp_degree=2,
+            pp_degree=1,
+            dp_degree=1,
+            enable_fsdp=False
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        model = SimpleModel()
+        
+        # Mock world size to be compatible with parallelism config
+        with patch.object(accelerator, 'num_processes', 2):
+            prepared_model = accelerator.prepare(model)
+            
+            # Verify model is returned and on correct device
+            self.assertIsInstance(prepared_model, nn.Module)
+            if torch.cuda.is_available():
+                self.assertEqual(next(prepared_model.parameters()).device.type, 'cuda')
+
+    def test_model_preparation_with_fsdp(self):
+        """Test model preparation with FSDP sharding."""
+        plugin = TorchTitanPlugin(
+            tp_degree=1,
+            pp_degree=1,
+            dp_degree=2,
+            enable_fsdp=True,
+            fsdp_sharding_strategy="FULL_SHARD",
+            fsdp_backward_prefetch="BACKWARD_PRE"
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        model = SimpleModel()
+        
+        with patch.object(accelerator, 'num_processes', 2):
+            prepared_model = accelerator.prepare(model)
+            
+            # Verify model is returned
+            self.assertIsInstance(prepared_model, nn.Module)
+
+    def test_model_preparation_with_activation_checkpointing(self):
+        """Test model preparation with activation checkpointing."""
+        plugin = TorchTitanPlugin(
+            activation_checkpointing=True,
+            selective_checkpointing_layers=["linear1", "linear2"]
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        model = SimpleModel()
+        
+        prepared_model = accelerator.prepare(model)
+        
+        # Verify model is returned
+        self.assertIsInstance(prepared_model, nn.Module)
+
+    def test_model_preparation_with_compilation(self):
+        """Test model preparation with torch.compile."""
+        plugin = TorchTitanPlugin(
+            compile_model=True,
+            compile_config={
+                "backend": "inductor",
+                "mode": "reduce-overhead"
+            }
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        model = SimpleModel()
+        
+        prepared_model = accelerator.prepare(model)
+        
+        # Verify model is returned
+        self.assertIsInstance(prepared_model, nn.Module)
+
+    def test_optimizer_preparation_with_sharding(self):
+        """Test optimizer preparation with FSDP and distributed optimization."""
+        plugin = TorchTitanPlugin(
+            tp_degree=2,
+            pp_degree=1,
+            dp_degree=1,
+            enable_fsdp=True
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        model = SimpleModel()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        
+        with patch.object(accelerator, 'num_processes', 2):
+            prepared_model, prepared_optimizer = accelerator.prepare(model, optimizer)
+            
+            # Verify both components are returned
+            self.assertIsInstance(prepared_model, nn.Module)
+            self.assertIsInstance(prepared_optimizer, torch.optim.Optimizer)
+
+    def test_scheduler_preparation_with_parallelism(self):
+        """Test scheduler preparation with multi-dimensional parallelism."""
+        plugin = TorchTitanPlugin(
+            tp_degree=2,
+            pp_degree=2,
+            dp_degree=1
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        model = SimpleModel()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10)
+        
+        with patch.object(accelerator, 'num_processes', 4):
+            prepared_model, prepared_optimizer, prepared_scheduler = accelerator.prepare(
+                model, optimizer, scheduler
+            )
+            
+            # Verify all components are returned
+            self.assertIsInstance(prepared_model, nn.Module)
+            self.assertIsInstance(prepared_optimizer, torch.optim.Optimizer)
+            self.assertIsInstance(prepared_scheduler, torch.optim.lr_scheduler._LRScheduler)
+
+    def test_dataloader_preparation_with_data_parallelism(self):
+        """Test dataloader preparation with data parallelism."""
+        plugin = TorchTitanPlugin(
+            tp_degree=1,
+            pp_degree=1,
+            dp_degree=4
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        
+        # Create dummy dataset and dataloader
+        dataset = torch.utils.data.TensorDataset(
+            torch.randn(100, 64),
+            torch.randint(0, 10, (100,))
+        )
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=8)
+        
+        with patch.object(accelerator, 'num_processes', 4):
+            prepared_dataloader = accelerator.prepare(dataloader)
+            
+            # Verify dataloader is returned
+            self.assertIsInstance(prepared_dataloader, torch.utils.data.DataLoader)
+
+    def test_mixed_precision_with_sharding(self):
+        """Test mixed precision training with sharding configurations."""
+        plugin = TorchTitanPlugin(
+            enable_fsdp=True,
+            fsdp_mixed_precision_policy={
+                "param": "fp16",
+                "reduce": "fp32",
+                "buffer": "fp32"
+            }
+        )
+        
+        accelerator = Accelerator(
+            torchtitan_plugin=plugin,
+            mixed_precision="bf16"
+        )
+        
+        self.assertEqual(accelerator.mixed_precision, "bf16")
+        self.assertTrue(accelerator.state.torchtitan_plugin.enable_fsdp)
+
+    def test_device_mesh_configuration(self):
+        """Test device mesh configuration for multi-dimensional parallelism."""
+        plugin = TorchTitanPlugin(
+            tp_degree=2,
+            pp_degree=2,
+            dp_degree=2
+        )
+        
+        # Test device mesh shape calculation
+        dp_size, tp_size, pp_size = plugin.get_device_mesh_config(8)
+        self.assertEqual((dp_size, tp_size, pp_size), (2, 2, 2))
+
+    def test_complete_training_setup_with_sharding(self):
+        """Test complete training setup with comprehensive sharding configuration."""
+        plugin = TorchTitanPlugin(
+            tp_degree=2,
+            pp_degree=1,
+            dp_degree=2,
+            enable_fsdp=True,
+            fsdp_sharding_strategy="FULL_SHARD",
+            activation_checkpointing=True,
+            compile_model=True,
+            job_config={
+                "training": {"batch_size": 16, "seq_len": 512},
+                "model": {"name": "llama3", "layers": 12}
+            }
+        )
+        
+        accelerator = Accelerator(
+            torchtitan_plugin=plugin,
+            mixed_precision="bf16"
+        )
+        
+        # Create training components
+        model = SimpleModel()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+        
+        dataset = torch.utils.data.TensorDataset(
+            torch.randn(200, 64),
+            torch.randint(0, 10, (200,))
+        )
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=16)
+        
+        with patch.object(accelerator, 'num_processes', 4):
+            prepared_components = accelerator.prepare(
+                model, optimizer, scheduler, dataloader
+            )
+            
+            # Verify all components are prepared
+            self.assertEqual(len(prepared_components), 4)
+            prepared_model, prepared_optimizer, prepared_scheduler, prepared_dataloader = prepared_components
+            
+            self.assertIsInstance(prepared_model, nn.Module)
+            self.assertIsInstance(prepared_optimizer, torch.optim.Optimizer)
+            self.assertIsInstance(prepared_scheduler, torch.optim.lr_scheduler._LRScheduler)
+            self.assertIsInstance(prepared_dataloader, torch.utils.data.DataLoader)
+
+    def test_memory_optimization_features(self):
+        """Test memory optimization features integration."""
+        plugin = TorchTitanPlugin(
+            enable_fsdp=True,
+            fsdp_cpu_offload=True,
+            activation_checkpointing=True,
+            selective_checkpointing_layers=["attention", "feed_forward"]
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        model = SimpleModel()
+        
+        prepared_model = accelerator.prepare(model)
+        
+        # Verify model preparation completes without errors
+        self.assertIsInstance(prepared_model, nn.Module)
+
+    def test_state_reset_with_sharding_config(self):
+        """Test accelerator state reset with sharding configurations."""
+        plugin = TorchTitanPlugin(
+            tp_degree=4,
+            pp_degree=2,
+            enable_fsdp=True
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        self.assertEqual(accelerator.distributed_type, DistributedType.TORCHTITAN)
+        
+        # Reset state
+        AcceleratorState._reset_state()
+        
+        # Create new accelerator
+        new_accelerator = Accelerator()
+        self.assertEqual(new_accelerator.distributed_type, DistributedType.NO)
+
+    def test_error_handling_in_sharding_setup(self):
+        """Test error handling in sharding setup methods."""
+        plugin = TorchTitanPlugin(
+            tp_degree=2,
+            pp_degree=2,
+            enable_fsdp=True,
+            activation_checkpointing=True,
+            compile_model=True
+        )
+        
+        accelerator = Accelerator(torchtitan_plugin=plugin)
+        model = SimpleModel()
+        
+        with patch.object(accelerator, 'num_processes', 4):
+            # This should handle any errors gracefully and still return a model
+            prepared_model = accelerator.prepare(model)
+            self.assertIsInstance(prepared_model, nn.Module)
 
 
 if __name__ == "__main__":

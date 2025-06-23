@@ -472,7 +472,7 @@ class ProfileKwargs(KwargsHandler):
             Callable that is called at each step when schedule returns `ProfilerAction.RECORD_AND_SAVE` during the
             profiling.
         record_shapes (`bool`, *optional*, default to `False`):
-            Save information about operator’s input shapes.
+            Save information about operator's input shapes.
         profile_memory (`bool`, *optional*, default to `False`):
             Track tensor memory allocation/deallocation
         with_stack (`bool`, *optional*, default to `False`):
@@ -2811,25 +2811,225 @@ class BnbQuantizationConfig:
 @dataclass
 class TorchTitanPlugin:
     """
-    This plugin is used to integrate TorchTitan.
+    This plugin is used to integrate TorchTitan with support for multi-dimensional parallelism.
 
     Args:
         job_config (`str` or `dict`, defaults to `None`):
             Path to TorchTitan config file or dict containing the config.
         model_name (`str`, defaults to `"llama3"`):
             Name of the model architecture to use.
+        tp_degree (`int`, defaults to `1`):
+            Tensor parallelism degree. Must be a divisor of the world size.
+        pp_degree (`int`, defaults to `1`):
+            Pipeline parallelism degree. Must be a divisor of the world size.
+        dp_degree (`int`, defaults to `None`):
+            Data parallelism degree. If None, will be calculated automatically as world_size / (tp_degree * pp_degree).
+        enable_fsdp (`bool`, defaults to `False`):
+            Whether to enable Fully Sharded Data Parallelism.
+        fsdp_sharding_strategy (`str`, defaults to `"FULL_SHARD"`):
+            FSDP sharding strategy. Options: "FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD".
+        fsdp_backward_prefetch (`str`, defaults to `"BACKWARD_PRE"`):
+            FSDP backward prefetch strategy. Options: "BACKWARD_PRE", "BACKWARD_POST", "NO_PREFETCH".
+        fsdp_mixed_precision_policy (`dict`, defaults to `None`):
+            FSDP mixed precision policy configuration.
+        fsdp_cpu_offload (`bool`, defaults to `False`):
+            Whether to enable FSDP CPU parameter offloading.
+        activation_checkpointing (`bool`, defaults to `False`):
+            Whether to enable activation checkpointing for memory optimization.
+        selective_checkpointing_layers (`list`, defaults to `None`):
+            List of layer names/types to apply selective activation checkpointing.
+        compile_model (`bool`, defaults to `False`):
+            Whether to compile the model using torch.compile.
+        compile_config (`dict`, defaults to `None`):
+            Configuration for torch.compile (backend, mode, etc.).
     """
 
     job_config: Optional[Union[str, dict]] = None
     model_name: str = "llama3"
+    
+    # Parallelism configuration
+    tp_degree: int = 1
+    pp_degree: int = 1
+    dp_degree: Optional[int] = None
+    
+    # FSDP configuration
+    enable_fsdp: bool = False
+    fsdp_sharding_strategy: str = "FULL_SHARD"
+    fsdp_backward_prefetch: str = "BACKWARD_PRE" 
+    fsdp_mixed_precision_policy: Optional[dict] = None
+    fsdp_cpu_offload: bool = False
+    
+    # Memory optimization
+    activation_checkpointing: bool = False
+    selective_checkpointing_layers: Optional[list[str]] = None
+    
+    # Compilation
+    compile_model: bool = False
+    compile_config: Optional[dict] = None
 
     def __post_init__(self):
+        # Validate parallelism degrees
+        if self.tp_degree < 1:
+            raise ValueError(f"tp_degree must be >= 1, got {self.tp_degree}")
+        if self.pp_degree < 1:
+            raise ValueError(f"pp_degree must be >= 1, got {self.pp_degree}")
+        
+        # Environment variable configuration
+        env_prefix = "TORCHTITAN_"
+        if self.tp_degree == 1:
+            self.tp_degree = int(os.environ.get(env_prefix + "TP_DEGREE", 1))
+        if self.pp_degree == 1:
+            self.pp_degree = int(os.environ.get(env_prefix + "PP_DEGREE", 1))
+        if self.dp_degree is None:
+            self.dp_degree = int(os.environ.get(env_prefix + "DP_DEGREE", 0))  # 0 means auto-calculate
+            
+        if self.enable_fsdp is False:
+            self.enable_fsdp = str_to_bool(os.environ.get(env_prefix + "ENABLE_FSDP", "False")) == 1
+        if self.activation_checkpointing is False:
+            self.activation_checkpointing = str_to_bool(os.environ.get(env_prefix + "ACTIVATION_CHECKPOINTING", "False")) == 1
+        if self.compile_model is False:
+            self.compile_model = str_to_bool(os.environ.get(env_prefix + "COMPILE_MODEL", "False")) == 1
+
+        # Validate FSDP sharding strategy (only if FSDP is enabled)
+        valid_fsdp_strategies = ["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD"]
+        if self.enable_fsdp and self.fsdp_sharding_strategy not in valid_fsdp_strategies:
+            raise ValueError(f"fsdp_sharding_strategy must be one of {valid_fsdp_strategies}, got {self.fsdp_sharding_strategy}")
+            
+        # Validate FSDP backward prefetch (only if FSDP is enabled)
+        valid_prefetch_strategies = ["BACKWARD_PRE", "BACKWARD_POST", "NO_PREFETCH"]  
+        if self.enable_fsdp and self.fsdp_backward_prefetch not in valid_prefetch_strategies:
+            raise ValueError(f"fsdp_backward_prefetch must be one of {valid_prefetch_strategies}, got {self.fsdp_backward_prefetch}")
+            
+        # Set default values when FSDP is disabled
+        if not self.enable_fsdp:
+            if self.fsdp_sharding_strategy is None:
+                self.fsdp_sharding_strategy = "FULL_SHARD"  # Default for validation
+            if self.fsdp_backward_prefetch is None:
+                self.fsdp_backward_prefetch = "BACKWARD_PRE"  # Default for validation
+
+        # Set up default job config
         if self.job_config is None:
-            # Use default minimal config
             self.job_config = {
                 "training": {"batch_size": 8, "seq_len": 512},
-                "model": {"name": self.model_name}
+                "model": {"name": self.model_name},
+                "parallelism": {
+                    "tp_size": self.tp_degree,
+                    "pp_size": self.pp_degree,
+                    "dp_size": self.dp_degree,
+                    "enable_fsdp": self.enable_fsdp
+                }
             }
+        elif isinstance(self.job_config, dict):
+            # Update parallelism config in existing job_config
+            if "parallelism" not in self.job_config:
+                self.job_config["parallelism"] = {}
+            self.job_config["parallelism"].update({
+                "tp_size": self.tp_degree,
+                "pp_size": self.pp_degree,
+                "dp_size": self.dp_degree,
+                "enable_fsdp": self.enable_fsdp
+            })
+            
+        # Set up compile config defaults
+        if self.compile_model and self.compile_config is None:
+            self.compile_config = {
+                "backend": "inductor",
+                "mode": "reduce-overhead",
+                "fullgraph": False,
+                "dynamic": False
+            }
+
+    def get_world_size_requirements(self) -> int:
+        """
+        Calculate the minimum world size required for the parallelism configuration.
+        
+        Returns:
+            int: Minimum required world size
+        """
+        if self.dp_degree and self.dp_degree > 0:
+            return self.tp_degree * self.pp_degree * self.dp_degree
+        else:
+            # If dp_degree is auto (None or 0), just return tp * pp
+            return self.tp_degree * self.pp_degree
+    
+    def validate_world_size(self, world_size: int) -> None:
+        """
+        Validate that the world size is compatible with parallelism configuration.
+        
+        Args:
+            world_size (int): The actual world size
+            
+        Raises:
+            ValueError: If world size is incompatible
+        """
+        min_required = self.get_world_size_requirements()
+        if self.dp_degree and self.dp_degree > 0:
+            # Exact world size requirement
+            if world_size != min_required:
+                raise ValueError(
+                    f"World size {world_size} does not match required size {min_required} "
+                    f"(tp_degree={self.tp_degree} * pp_degree={self.pp_degree} * dp_degree={self.dp_degree})"
+                )
+        else:
+            # Auto dp_degree - world size must be divisible by tp * pp
+            if world_size % min_required != 0:
+                raise ValueError(
+                    f"World size {world_size} must be divisible by tp_degree * pp_degree = {min_required}"
+                )
+            # Auto-calculate dp_degree
+            self.dp_degree = world_size // min_required
+            if isinstance(self.job_config, dict) and "parallelism" in self.job_config:
+                self.job_config["parallelism"]["dp_size"] = self.dp_degree
+
+    def get_fsdp_config(self) -> dict:
+        """
+        Get FSDP configuration dictionary.
+        
+        Returns:
+            dict: FSDP configuration
+        """
+        if not self.enable_fsdp:
+            return {}
+            
+        config = {
+            "sharding_strategy": self.fsdp_sharding_strategy,
+            "backward_prefetch": self.fsdp_backward_prefetch,
+            "cpu_offload": self.fsdp_cpu_offload,
+        }
+        
+        if self.fsdp_mixed_precision_policy:
+            config["mixed_precision_policy"] = self.fsdp_mixed_precision_policy
+            
+        return config
+        
+    def get_checkpointing_config(self) -> dict:
+        """
+        Get activation checkpointing configuration.
+        
+        Returns:
+            dict: Checkpointing configuration
+        """
+        if not self.activation_checkpointing:
+            return {}
+            
+        config = {"enabled": True}
+        if self.selective_checkpointing_layers:
+            config["selective_layers"] = self.selective_checkpointing_layers
+            
+        return config
+
+    def get_device_mesh_config(self, world_size: int) -> tuple[int, int, int]:
+        """
+        Get device mesh configuration for multi-dimensional parallelism.
+        
+        Args:
+            world_size (int): Total number of processes
+            
+        Returns:
+            tuple: (dp_size, tp_size, pp_size)
+        """
+        self.validate_world_size(world_size)
+        return (self.dp_degree, self.tp_degree, self.pp_degree)
 
 
 def get_module_class_from_name(module, name):
