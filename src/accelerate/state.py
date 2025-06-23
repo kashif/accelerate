@@ -968,6 +968,9 @@ class AcceleratorState:
                     first_plugin = next(iter(deepspeed_plugin.values()))
                     first_plugin.select(_from_accelerator_state=True)
                 self.deepspeed_plugins = deepspeed_plugin
+            elif os.environ.get("ACCELERATE_USE_TORCHTITAN", "false") == "true" and not cpu:
+                self.distributed_type = DistributedType.TORCHTITAN
+                self.torchtitan_plugin = torchtitan_plugin
             elif self.distributed_type in [
                 DistributedType.MULTI_GPU,
                 DistributedType.MULTI_MLU,

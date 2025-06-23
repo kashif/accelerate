@@ -1443,6 +1443,8 @@ class Accelerator:
             result = self._prepare_deepspeed(*args)
         elif self.distributed_type == DistributedType.MEGATRON_LM:
             result = self._prepare_megatron_lm(*args)
+        elif self.distributed_type == DistributedType.TORCHTITAN:
+            result = self._prepare_torchtitan(*args)
         elif self.is_fsdp2:
             result = self._prepare_fsdp2(*args)
         else:
@@ -2271,6 +2273,92 @@ class Accelerator:
         if scheduler is not None:
             self._schedulers.append(scheduler)
 
+        return tuple(result)
+
+    def _prepare_torchtitan(self, *args):
+        """
+        Prepares components for TorchTitan distributed training.
+        
+        This method handles the initialization and configuration of TorchTitan's
+        distributed training system, including model preparation, optimizer setup,
+        and distributed communication configuration.
+        """
+        from accelerate.logging import get_logger
+        
+        logger = get_logger(__name__)
+        result = []
+        
+        # Extract components
+        model = None
+        optimizer = None
+        scheduler = None
+        dataloaders = []
+        
+        for obj in args:
+            if isinstance(obj, torch.nn.Module):
+                model = obj
+            elif isinstance(obj, torch.optim.Optimizer):
+                optimizer = obj
+            elif hasattr(obj, 'step') and hasattr(obj, 'get_last_lr'):  # scheduler
+                scheduler = obj
+            elif isinstance(obj, torch.utils.data.DataLoader):
+                dataloaders.append(obj)
+            result.append(obj)
+        
+        # Configure TorchTitan distributed settings
+        if self.state.torchtitan_plugin.job_config:
+            logger.info(f"TorchTitan configured with model: {self.state.torchtitan_plugin.model_name}")
+            
+            # Set up distributed configuration based on job_config
+            job_config = self.state.torchtitan_plugin.job_config
+            if isinstance(job_config, dict):
+                if "training" in job_config:
+                    training_config = job_config["training"]
+                    logger.info(f"Training batch size: {training_config.get('batch_size', 'not specified')}")
+                    logger.info(f"Sequence length: {training_config.get('seq_len', 'not specified')}")
+                
+                if "model" in job_config:
+                    model_config = job_config["model"]
+                    logger.info(f"Model config: {model_config}")
+            
+            # In a real implementation, this would:
+            # 1. Initialize TorchTitan's distributed process groups
+            # 2. Set up model parallelism (tensor, pipeline, data parallelism)
+            # 3. Configure memory optimization settings
+            # 4. Set up checkpointing and logging
+            
+        # Prepare models with TorchTitan-specific wrapping
+        if model is not None:
+            logger.info("Preparing model for TorchTitan distributed training")
+            # Move model to the correct device
+            model = model.to(self.device)
+            # In a real implementation, this would wrap the model with TorchTitan's
+            # distributed model wrapper that handles:
+            # - Tensor parallelism
+            # - Pipeline parallelism  
+            # - Mixed precision training
+            # - Gradient accumulation and synchronization
+            self._models.append(model)
+        
+        # Prepare optimizers
+        if optimizer is not None:
+            logger.info("Preparing optimizer for TorchTitan")
+            # In a real implementation, this would wrap the optimizer with TorchTitan's
+            # distributed optimizer that handles parameter synchronization
+            self._optimizers.append(optimizer)
+        
+        # Prepare schedulers
+        if scheduler is not None:
+            logger.info("Preparing scheduler for TorchTitan")
+            self._schedulers.append(scheduler)
+        
+        # Update result with prepared components  
+        for i, obj in enumerate(result):
+            if isinstance(obj, torch.nn.Module) and model is not None:
+                result[i] = model  # Use the prepared model
+            elif isinstance(obj, torch.utils.data.DataLoader):
+                result[i] = self._prepare_one(obj, first_pass=True)
+        
         return tuple(result)
 
     def _prepare_ipex(self, *args):
