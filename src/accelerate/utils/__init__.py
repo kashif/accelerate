@@ -62,6 +62,7 @@ from .dataclasses import (
     TERecipeKwargs,
     TorchDynamoPlugin,
     TorchTensorParallelPlugin,
+    TorchTitanPlugin,
     add_model_config_to_megatron_parser,
 )
 from .environment import (

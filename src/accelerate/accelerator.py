@@ -71,6 +71,7 @@ from .utils import (
     TERecipeKwargs,
     TorchDynamoPlugin,
     TorchTensorParallelPlugin,
+    TorchTitanPlugin,
     apply_fp8_autowrap,
     check_os_kernel,
     clean_state_dict_for_safetensors,
@@ -212,6 +213,9 @@ class Accelerator:
         megatron_lm_plugin ([`~utils.MegatronLMPlugin`], *optional*):
             Tweak your MegatronLM related args using this argument. This argument is optional and can be configured
             directly using *accelerate config*
+        torchtitan_plugin ([`~utils.TorchTitanPlugin`], *optional*):
+            Tweak your TorchTitan related args using this argument. This argument is optional and can be configured
+            directly using *accelerate config*
         rng_types (list of `str` or [`~utils.RNGType`]):
             The list of random number generators to synchronize at the beginning of each iteration in your prepared
             dataloaders. Should be one or several of:
@@ -281,6 +285,7 @@ class Accelerator:
         fsdp_plugin: FullyShardedDataParallelPlugin | None = None,
         torch_tp_plugin: TorchTensorParallelPlugin | None = None,
         megatron_lm_plugin: MegatronLMPlugin | None = None,
+        torchtitan_plugin: TorchTitanPlugin | None = None,
         rng_types: list[str | RNGType] | None = None,
         log_with: str | LoggerType | GeneralTracker | list[str | LoggerType | GeneralTracker] | None = None,
         project_dir: str | os.PathLike | None = None,
@@ -400,6 +405,19 @@ class Accelerator:
             if not is_megatron_lm_available():
                 raise ImportError("Megatron is not installed. please build it from source.")
 
+        if torchtitan_plugin is None:  # init from env variables
+            torchtitan_plugin = (
+                TorchTitanPlugin() if os.environ.get("ACCELERATE_USE_TORCHTITAN", "false") == "true" else None
+            )
+        else:
+            if not isinstance(torchtitan_plugin, TorchTitanPlugin):
+                raise TypeError("`torchtitan_plugin` must be a TorchTitanPlugin object.")
+            os.environ["ACCELERATE_USE_TORCHTITAN"] = "true"  # use TorchTitan if plugin is provided
+
+        if torchtitan_plugin:
+            # TODO: Add proper TorchTitan availability check
+            pass
+
         # Kwargs handlers
         self.ddp_handler = None
         self.scaler_handler = None
@@ -448,6 +466,7 @@ class Accelerator:
             fsdp_plugin=fsdp_plugin,
             torch_tp_plugin=torch_tp_plugin,
             megatron_lm_plugin=megatron_lm_plugin,
+            torchtitan_plugin=torchtitan_plugin,
             _from_accelerator=True,
             **kwargs,
         )

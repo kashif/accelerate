@@ -586,6 +586,7 @@ class DistributedType(str, enum.Enum):
     XLA = "XLA"
     MEGATRON_LM = "MEGATRON_LM"
     MULTI_HPU = "MULTI_HPU"
+    TORCHTITAN = "TORCHTITAN"
 
 
 class SageMakerDistributedType(str, enum.Enum):
@@ -2805,6 +2806,30 @@ class BnbQuantizationConfig:
 
         if not isinstance(self.torch_dtype, torch.dtype):
             raise ValueError("torch_dtype must be a torch.dtype")
+
+
+@dataclass
+class TorchTitanPlugin:
+    """
+    This plugin is used to integrate TorchTitan.
+
+    Args:
+        job_config (`str` or `dict`, defaults to `None`):
+            Path to TorchTitan config file or dict containing the config.
+        model_name (`str`, defaults to `"llama3"`):
+            Name of the model architecture to use.
+    """
+
+    job_config: Optional[Union[str, dict]] = None
+    model_name: str = "llama3"
+
+    def __post_init__(self):
+        if self.job_config is None:
+            # Use default minimal config
+            self.job_config = {
+                "training": {"batch_size": 8, "seq_len": 512},
+                "model": {"name": self.model_name}
+            }
 
 
 def get_module_class_from_name(module, name):

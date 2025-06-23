@@ -884,6 +884,7 @@ class AcceleratorState:
         "use_ipex",
         "fsdp_plugin",
         "megatron_lm_plugin",
+        "torchtitan_plugin",
         "dynamo_plugin",
     ]
 
@@ -896,6 +897,7 @@ class AcceleratorState:
         fsdp_plugin=None,
         torch_tp_plugin=None,
         megatron_lm_plugin=None,
+        torchtitan_plugin=None,
         _from_accelerator: bool = False,
         **kwargs,
     ):
@@ -910,6 +912,7 @@ class AcceleratorState:
             self.deepspeed_plugins = None
             self.use_ipex = None
             self.torch_tp_plugin = torch_tp_plugin
+            self.torchtitan_plugin = torchtitan_plugin
             mixed_precision = (
                 parse_choice_from_env("ACCELERATE_MIXED_PRECISION", "no")
                 if mixed_precision is None
