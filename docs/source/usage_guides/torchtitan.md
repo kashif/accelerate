@@ -700,8 +700,7 @@ torchtitan_plugin = TorchTitanPlugin(
 
 - [TorchTitan GitHub Repository](https://github.com/pytorch/torchtitan)
 - [TorchTitan Documentation](https://github.com/pytorch/torchtitan/tree/main/docs)
-- [TorchTitan Examples](https://github.com/pytorch/torchtitan/tree/main/train_configs)
-- [Multi-dimensional Parallelism Paper](https://arxiv.org/abs/1909.08053)
-- [FSDP Paper](https://arxiv.org/abs/2304.11277)
-
-The TorchTitan integration in Accelerate provides a powerful and flexible way to scale your large language model training across multiple GPUs and nodes while maintaining the simplicity and ease of use that Accelerate is known for. With comprehensive checkpointing, advanced memory optimization, and multi-dimensional parallelism support, TorchTitan enables efficient training of the largest language models. 
+- [TorchTitan: One-stop PyTorch native solution for production ready LLM pre-training](https://arxiv.org/abs/2410.06511)
+- [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053)
+- [PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel](https://arxiv.org/abs/2304.11277)
+- [SimpleFSDP: Simpler Fully Sharded Data Parallel with torch.compile](https://arxiv.org/abs/2411.00284)
