@@ -2278,45 +2278,45 @@ class Accelerator:
     def _prepare_torchtitan(self, *args):
         """
         Prepares components for TorchTitan distributed training with comprehensive sharding support.
-        
+
         This method handles the initialization and configuration of TorchTitan's
         distributed training system, including multi-dimensional parallelism (tensor, pipeline, data),
         FSDP sharding, activation checkpointing, model compilation, and memory optimizations.
         """
         from accelerate.logging import get_logger
-        
+
         logger = get_logger(__name__)
         result = []
-        
+
         # Extract components
         model = None
         optimizer = None
         scheduler = None
         dataloaders = []
-        
+
         for obj in args:
             if isinstance(obj, torch.nn.Module):
                 model = obj
             elif isinstance(obj, torch.optim.Optimizer):
                 optimizer = obj
-            elif hasattr(obj, 'step') and hasattr(obj, 'get_last_lr'):  # scheduler
+            elif hasattr(obj, "step") and hasattr(obj, "get_last_lr"):  # scheduler
                 scheduler = obj
             elif isinstance(obj, torch.utils.data.DataLoader):
                 dataloaders.append(obj)
             result.append(obj)
-        
+
         # Validate parallelism configuration against world size
         plugin = self.state.torchtitan_plugin
         world_size = self.num_processes
         plugin.validate_world_size(world_size)
-        
+
         dp_size, tp_size, pp_size = plugin.get_device_mesh_config(world_size)
         logger.info(f"TorchTitan parallelism configuration: DP={dp_size}, TP={tp_size}, PP={pp_size}")
-        
+
         # Configure TorchTitan distributed settings
         if plugin.job_config:
             logger.info(f"TorchTitan configured with model: {plugin.model_name}")
-            
+
             # Set up distributed configuration based on job_config
             job_config = plugin.job_config
             if isinstance(job_config, dict):
@@ -2324,70 +2324,72 @@ class Accelerator:
                     training_config = job_config["training"]
                     logger.info(f"Training batch size: {training_config.get('batch_size', 'not specified')}")
                     logger.info(f"Sequence length: {training_config.get('seq_len', 'not specified')}")
-                
+
                 if "model" in job_config:
                     model_config = job_config["model"]
                     logger.info(f"Model config: {model_config}")
-                    
+
                 if "parallelism" in job_config:
                     parallelism_config = job_config["parallelism"]
                     logger.info(f"Parallelism config: {parallelism_config}")
-        
+
         # Prepare device mesh for multi-dimensional parallelism
         device_mesh = None
         if tp_size > 1 or pp_size > 1:
             logger.info("Setting up device mesh for multi-dimensional parallelism")
             device_mesh = self._setup_torchtitan_device_mesh(dp_size, tp_size, pp_size)
-        
+
         # Prepare models with TorchTitan-specific wrapping
         if model is not None:
             logger.info("Preparing model for TorchTitan distributed training")
-            
+
             # Move model to the correct device
             model = model.to(self.device)
-            
+
             # Apply FSDP if enabled
             if plugin.enable_fsdp:
                 model = self._setup_torchtitan_fsdp(model, plugin)
-                
+
             # Apply tensor parallelism
             if tp_size > 1:
                 model = self._setup_torchtitan_tensor_parallel(model, device_mesh, tp_size)
-                
-            # Apply pipeline parallelism  
+
+            # Apply pipeline parallelism
             if pp_size > 1:
                 model = self._setup_torchtitan_pipeline_parallel(model, device_mesh, pp_size)
-                
+
             # Apply activation checkpointing
             if plugin.activation_checkpointing:
                 model = self._setup_torchtitan_activation_checkpointing(model, plugin)
-                
+
             # Apply model compilation
             if plugin.compile_model:
                 model = self._setup_torchtitan_compilation(model, plugin)
-                
+
             self._models.append(model)
-            
+
             # Memory usage tracking
             if torch.cuda.is_available():
                 allocated_memory = torch.cuda.memory_allocated(self.device) / 1024**3  # GB
-                reserved_memory = torch.cuda.memory_reserved(self.device) / 1024**3   # GB
-                logger.info(f"GPU memory after model setup - Allocated: {allocated_memory:.2f} GB, Reserved: {reserved_memory:.2f} GB")
-        
+                reserved_memory = torch.cuda.memory_reserved(self.device) / 1024**3  # GB
+                logger.info(
+                    f"GPU memory after model setup - Allocated: {allocated_memory:.2f} GB, Reserved: {reserved_memory:.2f} GB"
+                )
+
         # Prepare optimizers with TorchTitan-specific optimizations
         if optimizer is not None:
             logger.info("Preparing optimizer for TorchTitan")
-            
+
             # Configure optimizer for FSDP if enabled
             if plugin.enable_fsdp:
                 optimizer = self._setup_torchtitan_fsdp_optimizer(optimizer, model, plugin)
-                
+
             # Configure distributed optimizer for multi-dimensional parallelism
             if tp_size > 1 or pp_size > 1:
                 optimizer = self._setup_torchtitan_distributed_optimizer(optimizer, device_mesh)
-                
+
             self._optimizers.append(optimizer)
-        
+
         # Prepare schedulers
         if scheduler is not None:
             logger.info("Preparing scheduler for TorchTitan")
@@ -2396,7 +2398,7 @@ class Accelerator:
             if tp_size > 1 or pp_size > 1:
                 scheduler = self._setup_torchtitan_distributed_scheduler(scheduler, dp_size, tp_size, pp_size)
             self._schedulers.append(scheduler)
-        
+
         # Prepare dataloaders with sharding-aware sampling
         prepared_dataloaders = []
         for dataloader in dataloaders:
@@ -2405,15 +2407,15 @@ class Accelerator:
             if dp_size > 1:
                 dataloader = self._setup_torchtitan_distributed_dataloader(dataloader, dp_size, device_mesh)
             prepared_dataloaders.append(dataloader)
-        
-        # Update result with prepared components  
+
+        # Update result with prepared components
         dataloader_idx = 0
         for i, obj in enumerate(result):
             if isinstance(obj, torch.nn.Module) and model is not None:
                 result[i] = model  # Use the prepared model
             elif isinstance(obj, torch.optim.Optimizer) and optimizer is not None:
-                result[i] = optimizer  # Use the prepared optimizer  
-            elif hasattr(obj, 'step') and hasattr(obj, 'get_last_lr') and scheduler is not None:
+                result[i] = optimizer  # Use the prepared optimizer
+            elif hasattr(obj, "step") and hasattr(obj, "get_last_lr") and scheduler is not None:
                 result[i] = scheduler  # Use the prepared scheduler
             elif isinstance(obj, torch.utils.data.DataLoader):
                 if dataloader_idx < len(prepared_dataloaders):
@@ -2421,44 +2423,45 @@ class Accelerator:
                     dataloader_idx += 1
                 else:
                     result[i] = self._prepare_one(obj, first_pass=True)
-        
+
         # Set up TorchTitan checkpoint manager if checkpointing is enabled
         if plugin.enable_checkpoint:
             # Collect prepared models, optimizers, and schedulers
             prepared_models = [obj for obj in result if isinstance(obj, torch.nn.Module)]
             prepared_optimizers = [obj for obj in result if isinstance(obj, torch.optim.Optimizer)]
-            prepared_schedulers = [obj for obj in result if hasattr(obj, 'step') and hasattr(obj, 'get_last_lr')]
-            
+            prepared_schedulers = [obj for obj in result if hasattr(obj, "step") and hasattr(obj, "get_last_lr")]
+
             self._torchtitan_checkpoint_manager = self._setup_torchtitan_checkpoint_manager(
                 model_parts=prepared_models,
                 optimizers=prepared_optimizers,
                 lr_schedulers=prepared_schedulers,
                 dataloader=prepared_dataloaders[0] if prepared_dataloaders else None,
-                plugin=plugin
+                plugin=plugin,
             )
-            
+
             # Try to load existing checkpoint
             if self._torchtitan_checkpoint_manager:
                 self.load_torchtitan_checkpoint()
 
         logger.info("TorchTitan preparation completed successfully")
         return tuple(result)
-    
+
     def _setup_torchtitan_device_mesh(self, dp_size, tp_size, pp_size):
         """Set up device mesh for multi-dimensional parallelism."""
         from accelerate.logging import get_logger
+
         logger = get_logger(__name__)
-        
+
         try:
             # Create 3D device mesh for (DP, TP, PP) dimensions
             mesh_shape = (dp_size, tp_size, pp_size)
             mesh_dim_names = ("dp", "tp", "pp")
-            
+
             logger.info(f"Creating device mesh with shape {mesh_shape} and dims {mesh_dim_names}")
-            
+
             # Use torch.distributed.device_mesh for actual device mesh creation
             from torch.distributed.device_mesh import init_device_mesh
-            
+
             # Determine device type based on available hardware
             if self.device.type == "cuda":
                 device_type = "cuda"
@@ -2466,33 +2469,30 @@ class Accelerator:
                 device_type = "cpu"
             else:
                 device_type = self.device.type
-            
+
             device_mesh = init_device_mesh(device_type, mesh_shape, mesh_dim_names=mesh_dim_names)
-            
+
             logger.info(f"Successfully created device mesh: {device_mesh}")
             return device_mesh
-            
+
         except Exception as e:
             logger.warning(f"Failed to create device mesh: {e}. Falling back to basic distributed setup.")
             # Return a mock device mesh for compatibility
-            return {
-                "shape": mesh_shape,
-                "dim_names": mesh_dim_names,
-                "device_type": self.device.type
-            }
-    
+            return {"shape": mesh_shape, "dim_names": mesh_dim_names, "device_type": self.device.type}
+
     def _setup_torchtitan_fsdp(self, model, plugin):
         """Set up FSDP sharding for the model."""
         from accelerate.logging import get_logger
+
         logger = get_logger(__name__)
-        
+
         try:
+            from torch.distributed.fsdp import BackwardPrefetch, CPUOffload, ShardingStrategy
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
-            
+
             fsdp_config = plugin.get_fsdp_config()
             logger.info(f"Applying FSDP with config: {fsdp_config}")
-            
+
             # Map string values to FSDP enums
             sharding_strategy_map = {
                 "FULL_SHARD": ShardingStrategy.FULL_SHARD,
@@ -2500,110 +2500,116 @@ class Accelerator:
                 "NO_SHARD": ShardingStrategy.NO_SHARD,
                 "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
             }
-            
+
             backward_prefetch_map = {
                 "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
                 "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
                 "NO_PREFETCH": None,
             }
-            
+
             # Build FSDP configuration
             fsdp_kwargs = {}
-            
+
             # Set sharding strategy
             if plugin.fsdp_sharding_strategy in sharding_strategy_map:
                 fsdp_kwargs["sharding_strategy"] = sharding_strategy_map[plugin.fsdp_sharding_strategy]
                 logger.info(f"FSDP sharding strategy: {plugin.fsdp_sharding_strategy}")
-            
+
             # Set backward prefetch
             if plugin.fsdp_backward_prefetch in backward_prefetch_map:
                 prefetch = backward_prefetch_map[plugin.fsdp_backward_prefetch]
                 if prefetch is not None:
                     fsdp_kwargs["backward_prefetch"] = prefetch
                 logger.info(f"FSDP backward prefetch: {plugin.fsdp_backward_prefetch}")
-            
+
             # Set CPU offload
             if plugin.fsdp_cpu_offload:
                 fsdp_kwargs["cpu_offload"] = CPUOffload(offload_params=True)
                 logger.info("FSDP CPU offload enabled")
-            
+
             # Set mixed precision policy if specified
             if plugin.fsdp_mixed_precision_policy:
                 from torch.distributed.fsdp import MixedPrecision
-                
+
                 # Convert dict to MixedPrecision object if needed
                 if isinstance(plugin.fsdp_mixed_precision_policy, dict):
                     mp_policy = MixedPrecision(**plugin.fsdp_mixed_precision_policy)
                 else:
                     mp_policy = plugin.fsdp_mixed_precision_policy
-                
+
                 fsdp_kwargs["mixed_precision"] = mp_policy
                 logger.info(f"FSDP mixed precision policy: {plugin.fsdp_mixed_precision_policy}")
-            
+
             # Apply FSDP wrapping
             model = FSDP(model, **fsdp_kwargs)
             logger.info("Successfully applied FSDP to model")
-            
+
             return model
-            
+
         except Exception as e:
             logger.warning(f"Failed to apply FSDP: {e}. Using model without FSDP.")
             return model
-    
+
     def _setup_torchtitan_tensor_parallel(self, model, device_mesh, tp_size):
         """Set up tensor parallelism for the model."""
         from accelerate.logging import get_logger
+
         logger = get_logger(__name__)
-        
+
         try:
             if tp_size <= 1:
                 logger.info("TP size <= 1, skipping tensor parallelism")
                 return model
-                
+
             logger.info(f"Applying tensor parallelism with TP size: {tp_size}")
-            
+
             # Use torch.distributed.tensor for tensor parallelism
             from torch.distributed.tensor.parallel import parallelize_module
             from torch.distributed.tensor.parallel.colwise_parallel import ColwiseParallel
             from torch.distributed.tensor.parallel.rowwise_parallel import RowwiseParallel
-            
+
             # Get the TP submesh from the device mesh
-            if hasattr(device_mesh, 'get_submesh'):
+            if hasattr(device_mesh, "get_submesh"):
                 tp_mesh = device_mesh.get_submesh("tp")
             else:
                 # Fallback for mock device mesh
                 logger.warning("Using fallback TP mesh setup")
                 tp_mesh = device_mesh
-            
+
             # Define parallelization plan for common transformer architectures
             # This targets common layer patterns in LLaMA, GPT, etc.
             parallelize_plan = {}
-            
+
             # Find and parallelize linear layers in attention and MLP blocks
             for name, module in model.named_modules():
                 # Target attention projection layers
-                if any(layer_type in name.lower() for layer_type in ['q_proj', 'k_proj', 'v_proj', 'query', 'key', 'value']):
+                if any(
+                    layer_type in name.lower()
+                    for layer_type in ["q_proj", "k_proj", "v_proj", "query", "key", "value"]
+                ):
                     if isinstance(module, torch.nn.Linear):
                         parallelize_plan[name] = ColwiseParallel()
                         logger.debug(f"Marking {name} for colwise parallelism")
-                
+
                 # Target attention output projection
-                elif any(layer_type in name.lower() for layer_type in ['o_proj', 'out_proj', 'dense']):
+                elif any(layer_type in name.lower() for layer_type in ["o_proj", "out_proj", "dense"]):
                     if isinstance(module, torch.nn.Linear):
                         parallelize_plan[name] = RowwiseParallel()
                         logger.debug(f"Marking {name} for rowwise parallelism")
-                
+
                 # Target MLP layers
-                elif any(layer_type in name.lower() for layer_type in ['gate_proj', 'up_proj', 'fc1', 'mlp.w1', 'mlp.w3']):
+                elif any(
+                    layer_type in name.lower() for layer_type in ["gate_proj", "up_proj", "fc1", "mlp.w1", "mlp.w3"]
+                ):
                     if isinstance(module, torch.nn.Linear):
                         parallelize_plan[name] = ColwiseParallel()
                         logger.debug(f"Marking {name} for colwise parallelism")
-                
-                elif any(layer_type in name.lower() for layer_type in ['down_proj', 'fc2', 'mlp.w2']):
+
+                elif any(layer_type in name.lower() for layer_type in ["down_proj", "fc2", "mlp.w2"]):
                     if isinstance(module, torch.nn.Linear):
                         parallelize_plan[name] = RowwiseParallel()
                         logger.debug(f"Marking {name} for rowwise parallelism")
-            
+
             # Apply tensor parallelism
             if parallelize_plan:
                 logger.info(f"Applying tensor parallelism to {len(parallelize_plan)} layers")
@@ -2611,298 +2617,308 @@ class Accelerator:
                 logger.info("Successfully applied tensor parallelism")
             else:
                 logger.warning("No suitable layers found for tensor parallelism")
-            
+
             return model
-            
+
         except Exception as e:
             logger.warning(f"Failed to apply tensor parallelism: {e}. Using model without TP.")
             return model
-    
+
     def _setup_torchtitan_pipeline_parallel(self, model, device_mesh, pp_size):
         """Set up pipeline parallelism for the model."""
         from accelerate.logging import get_logger
+
         logger = get_logger(__name__)
-        
+
         try:
             if pp_size <= 1:
                 logger.info("PP size <= 1, skipping pipeline parallelism")
                 return model
-                
+
             logger.info(f"Applying pipeline parallelism with PP size: {pp_size}")
-            
+
             # Use torch.distributed.pipelining for pipeline parallelism
-            from torch.distributed.pipelining import PipelineStage, pipeline
-            
+
             # Get the PP submesh from the device mesh
-            if hasattr(device_mesh, 'get_submesh'):
-                pp_mesh = device_mesh.get_submesh("pp")
+            if hasattr(device_mesh, "get_submesh"):
+                # Note: PP mesh would be used for more sophisticated pipeline parallelism
+                # Currently using simplified approach with layer splitting
+                pass
             else:
                 # Fallback for mock device mesh
                 logger.warning("Using fallback PP mesh setup")
-                pp_mesh = device_mesh
-            
+                # Note: Using device_mesh directly for fallback case
+
             # For transformer models, split by layers
             # This is a simplified approach - real implementations would be more sophisticated
             model_layers = []
-            
+
             # Try to find transformer layers/blocks
             for name, module in model.named_children():
-                if any(layer_type in name.lower() for layer_type in ['layers', 'blocks', 'transformer', 'decoder']):
-                    if hasattr(module, '__len__'):  # Sequential-like container
+                if any(layer_type in name.lower() for layer_type in ["layers", "blocks", "transformer", "decoder"]):
+                    if hasattr(module, "__len__"):  # Sequential-like container
                         model_layers.extend(list(module))
                     else:
                         model_layers.append(module)
                 else:
                     model_layers.append(module)
-            
+
             if len(model_layers) < pp_size:
-                logger.warning(f"Model has {len(model_layers)} layers but PP size is {pp_size}. Using model without PP.")
+                logger.warning(
+                    f"Model has {len(model_layers)} layers but PP size is {pp_size}. Using model without PP."
+                )
                 return model
-            
+
             # Split layers into stages
             layers_per_stage = len(model_layers) // pp_size
             stages = []
-            
+
             for stage_idx in range(pp_size):
                 start_idx = stage_idx * layers_per_stage
                 if stage_idx == pp_size - 1:  # Last stage gets remaining layers
                     end_idx = len(model_layers)
                 else:
                     end_idx = (stage_idx + 1) * layers_per_stage
-                
+
                 stage_layers = model_layers[start_idx:end_idx]
                 stage_model = torch.nn.Sequential(*stage_layers)
                 stages.append(stage_model)
-                
-                logger.info(f"Stage {stage_idx}: layers {start_idx}-{end_idx-1}")
-            
+
+                logger.info(f"Stage {stage_idx}: layers {start_idx}-{end_idx - 1}")
+
             # Create pipeline
             # Note: This is a simplified implementation
             # Real pipeline parallelism would require more sophisticated scheduling
             current_rank = self.process_index
             stage_rank = current_rank % pp_size
-            
+
             if stage_rank < len(stages):
                 model = stages[stage_rank]
                 logger.info(f"Rank {current_rank} assigned to pipeline stage {stage_rank}")
             else:
                 logger.warning(f"Rank {current_rank} not assigned to any pipeline stage")
-            
+
             logger.info("Successfully applied pipeline parallelism")
             return model
-            
+
         except Exception as e:
             logger.warning(f"Failed to apply pipeline parallelism: {e}. Using model without PP.")
             return model
-    
+
     def _setup_torchtitan_activation_checkpointing(self, model, plugin):
         """Set up activation checkpointing for memory optimization."""
         from accelerate.logging import get_logger
+
         logger = get_logger(__name__)
-        
+
         try:
             if not plugin.activation_checkpointing:
                 logger.info("Activation checkpointing disabled")
                 return model
-                
+
             checkpointing_config = plugin.get_checkpointing_config()
             logger.info(f"Applying activation checkpointing with config: {checkpointing_config}")
-            
+
             from torch.utils.checkpoint import checkpoint
-            
+
             # Apply activation checkpointing to specified layers or all transformer blocks
             checkpointed_modules = []
-            
+
             if plugin.selective_checkpointing_layers:
                 # Apply checkpointing to specific layer types
                 logger.info(f"Selective checkpointing for layers: {plugin.selective_checkpointing_layers}")
-                
+
                 for name, module in model.named_modules():
                     if any(layer_type in name.lower() for layer_type in plugin.selective_checkpointing_layers):
                         # Wrap the forward method with checkpointing
                         original_forward = module.forward
-                        
+
                         def checkpointed_forward(*args, **kwargs):
                             return checkpoint(original_forward, *args, **kwargs, use_reentrant=False)
-                        
+
                         module.forward = checkpointed_forward
                         checkpointed_modules.append(name)
                         logger.debug(f"Applied checkpointing to {name}")
             else:
                 # Apply checkpointing to all transformer blocks
                 logger.info("Applying checkpointing to all transformer blocks")
-                
+
                 for name, module in model.named_modules():
                     # Target common transformer block patterns
-                    if any(block_type in name.lower() for block_type in ['block', 'layer', 'transformerblock', 'decoderlayer']):
+                    if any(
+                        block_type in name.lower()
+                        for block_type in ["block", "layer", "transformerblock", "decoderlayer"]
+                    ):
                         # Skip if it's a container with other blocks inside
                         has_nested_blocks = any(
-                            any(block_type in child_name.lower() for block_type in ['block', 'layer'])
+                            any(block_type in child_name.lower() for block_type in ["block", "layer"])
                             for child_name, _ in module.named_children()
                         )
-                        
-                        if not has_nested_blocks and hasattr(module, 'forward'):
+
+                        if not has_nested_blocks and hasattr(module, "forward"):
                             original_forward = module.forward
-                            
+
                             def checkpointed_forward(*args, **kwargs):
                                 return checkpoint(original_forward, *args, **kwargs, use_reentrant=False)
-                            
+
                             module.forward = checkpointed_forward
                             checkpointed_modules.append(name)
                             logger.debug(f"Applied checkpointing to {name}")
-            
+
             if checkpointed_modules:
                 logger.info(f"Successfully applied activation checkpointing to {len(checkpointed_modules)} modules")
             else:
                 logger.warning("No suitable modules found for activation checkpointing")
-            
+
             return model
-            
+
         except Exception as e:
             logger.warning(f"Failed to apply activation checkpointing: {e}. Using model without checkpointing.")
             return model
-    
+
     def _setup_torchtitan_compilation(self, model, plugin):
         """Set up model compilation for performance optimization."""
         from accelerate.logging import get_logger
+
         logger = get_logger(__name__)
-        
+
         try:
             if not plugin.compile_model:
                 logger.info("Model compilation disabled")
                 return model
-                
+
             compile_config = plugin.compile_config or {}
             logger.info(f"Compiling model with config: {compile_config}")
-            
+
             # Apply torch.compile with the specified configuration
-            if hasattr(torch, 'compile'):
+            if hasattr(torch, "compile"):
                 model = torch.compile(model, **compile_config)
                 logger.info("Model compilation successful")
             else:
                 logger.warning("torch.compile not available. Skipping model compilation.")
-            
+
             return model
         except Exception as e:
             logger.warning(f"Failed to compile model: {e}. Using model without compilation.")
             return model
-    
+
     def _setup_torchtitan_fsdp_optimizer(self, optimizer, model, plugin):
         """Configure optimizer for FSDP training."""
         from accelerate.logging import get_logger
+
         logger = get_logger(__name__)
-        
+
         try:
             if not plugin.enable_fsdp:
                 logger.info("FSDP disabled, using standard optimizer")
                 return optimizer
-                
+
             logger.info("Configuring optimizer for FSDP training")
-            
+
             # For FSDP, we need to ensure the optimizer works with sharded parameters
             # The model should already be wrapped with FSDP at this point
-            
+
             # Check if model is FSDP wrapped
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            
+
             if isinstance(model, FSDP):
                 logger.info("Model is FSDP wrapped, optimizer will work with sharded parameters")
                 # FSDP handles parameter sharding automatically
                 # No special optimizer configuration needed in most cases
             else:
                 logger.warning("Model is not FSDP wrapped, optimizer may not work correctly")
-            
+
             return optimizer
         except Exception as e:
             logger.warning(f"Failed to configure FSDP optimizer: {e}. Using standard optimizer.")
             return optimizer
-    
+
     def _setup_torchtitan_distributed_optimizer(self, optimizer, device_mesh):
         """Configure optimizer for multi-dimensional parallelism."""
         from accelerate.logging import get_logger
+
         logger = get_logger(__name__)
-        
+
         try:
             logger.info("Configuring optimizer for distributed training")
-            
+
             # For multi-dimensional parallelism, we need to handle parameter synchronization
             # across different parallelism dimensions
-            
-            if hasattr(device_mesh, 'shape') and len(device_mesh.get('shape', [])) > 1:
+
+            if hasattr(device_mesh, "shape") and len(device_mesh.get("shape", [])) > 1:
                 logger.info(f"Multi-dimensional parallelism detected: {device_mesh.get('shape', [])}")
-                
+
                 # In a full implementation, this would use torch.distributed.optim
                 # to create a distributed optimizer that handles gradient synchronization
                 # across different parallelism dimensions
-                
+
                 # For now, we use the standard optimizer but log the configuration
                 logger.info("Using standard optimizer with distributed parameter management")
             else:
                 logger.info("Single-dimensional parallelism, using standard optimizer")
-            
+
             return optimizer
         except Exception as e:
             logger.warning(f"Failed to configure distributed optimizer: {e}. Using standard optimizer.")
             return optimizer
-    
+
     def _setup_torchtitan_distributed_scheduler(self, scheduler, dp_size, tp_size, pp_size):
         """Configure scheduler for multi-dimensional parallelism."""
         from accelerate.logging import get_logger
+
         logger = get_logger(__name__)
-        
+
         try:
             logger.info("Configuring scheduler for distributed training")
-            
+
             # Calculate effective batch size across different parallelism dimensions
             # Only data parallelism affects the effective batch size for gradient updates
             effective_batch_multiplier = dp_size
-            
+
             logger.info(f"Parallelism configuration: DP={dp_size}, TP={tp_size}, PP={pp_size}")
             logger.info(f"Effective batch size multiplier: {effective_batch_multiplier}")
-            
+
             # For most schedulers, no adjustment is needed as the effective learning rate
             # scaling is handled by the optimizer and gradient synchronization
-            
+
             # However, for schedulers that depend on the number of steps,
             # we might need to adjust based on the gradient accumulation pattern
-            
-            if hasattr(scheduler, 'total_steps'):
+
+            if hasattr(scheduler, "total_steps"):
                 logger.info(f"Scheduler has total_steps: {scheduler.total_steps}")
                 # In pipeline parallelism, the number of micro-batches per step might change
                 # This is handled by the pipeline scheduling logic
-            
+
             return scheduler
         except Exception as e:
             logger.warning(f"Failed to configure distributed scheduler: {e}. Using standard scheduler.")
             return scheduler
-    
+
     def _setup_torchtitan_distributed_dataloader(self, dataloader, dp_size, device_mesh):
         """
         Set up distributed dataloader for TorchTitan with proper data parallelism.
-        
+
         Args:
             dataloader: The dataloader to distribute
             dp_size: Data parallelism size
             device_mesh: The device mesh for distributed training
-            
+
         Returns:
             Distributed dataloader
         """
         try:
             import torch.distributed as dist
             from torch.utils.data.distributed import DistributedSampler
-            
+
             # Create distributed sampler if not already present
             if not isinstance(dataloader.sampler, DistributedSampler):
                 sampler = DistributedSampler(
-                    dataloader.dataset,
-                    num_replicas=dp_size,
-                    rank=dist.get_rank() % dp_size,
-                    shuffle=True
+                    dataloader.dataset, num_replicas=dp_size, rank=dist.get_rank() % dp_size, shuffle=True
                 )
-                
+
                 # Create new dataloader with distributed sampler
                 from torch.utils.data import DataLoader
+
                 distributed_dataloader = DataLoader(
                     dataset=dataloader.dataset,
                     batch_size=dataloader.batch_size,
@@ -2910,12 +2926,12 @@ class Accelerator:
                     num_workers=dataloader.num_workers,
                     collate_fn=dataloader.collate_fn,
                     pin_memory=dataloader.pin_memory,
-                    drop_last=dataloader.drop_last
+                    drop_last=dataloader.drop_last,
                 )
                 return distributed_dataloader
-            
+
             return dataloader
-            
+
         except ImportError as e:
             logger.warning(f"Failed to set up TorchTitan distributed dataloader: {e}")
             return dataloader
@@ -4639,48 +4655,46 @@ class Accelerator:
     def _setup_torchtitan_checkpoint_manager(self, model_parts, optimizers, lr_schedulers, dataloader, plugin):
         """
         Set up TorchTitan's advanced checkpointing system.
-        
+
         Args:
             model_parts: List of model parts for pipeline parallelism
             optimizers: Container of optimizers
             lr_schedulers: Container of LR schedulers
             dataloader: Training dataloader
             plugin: TorchTitanPlugin configuration
-            
+
         Returns:
             TorchTitan CheckpointManager instance
         """
         try:
             # Import TorchTitan checkpointing components
-            from torchtitan.components.checkpoint import CheckpointManager, AsyncMode
-            import torch.distributed as dist
-            import os
-            
+            from torchtitan.components.checkpoint import CheckpointManager
+
             # Create training state container
             class TrainState:
                 def __init__(self):
                     self.step = 0
-                    
+
                 def state_dict(self):
                     return {"step": self.step}
-                    
+
                 def load_state_dict(self, state_dict):
                     self.step = state_dict.get("step", 0)
-            
+
             train_state = TrainState()
-            
+
             # Create states dictionary for checkpointing
             states = {
                 "train_state": train_state,
             }
-            
+
             # Create job config for checkpoint manager
             class JobConfig:
                 def __init__(self, plugin):
                     self.checkpoint = self._create_checkpoint_config(plugin)
                     self.job = self._create_job_config()
                     self.fault_tolerance = self._create_ft_config()
-                    
+
                 def _create_checkpoint_config(self, plugin):
                     class CheckpointConfig:
                         def __init__(self, plugin):
@@ -4695,71 +4709,74 @@ class Accelerator:
                             self.exclude_from_loading = plugin.checkpoint_exclude_from_loading or []
                             self.initial_load_path = plugin.checkpoint_initial_load_path
                             self.initial_load_model_weights_only = plugin.checkpoint_initial_load_model_weights_only
+
                     return CheckpointConfig(plugin)
-                    
+
                 def _create_job_config(self):
                     class JobConfigInner:
                         def __init__(self):
                             self.dump_folder = "."
+
                     return JobConfigInner()
-                    
+
                 def _create_ft_config(self):
                     class FTConfig:
                         def __init__(self):
                             self.replica_id = 0
+
                     return FTConfig()
-            
+
             job_config = JobConfig(plugin)
-            
+
             # Create fault tolerance manager (disabled for now)
             class FTManager:
                 def __init__(self):
                     self.enabled = False
                     self.manager = None
-            
+
             ft_manager = FTManager()
-            
+
             # Create optimizers container
             class OptimizersContainer:
                 def __init__(self, optimizers):
                     self._optimizers = optimizers if isinstance(optimizers, list) else [optimizers]
-                    
+
                 def state_dict(self):
                     if len(self._optimizers) == 1:
                         return self._optimizers[0].state_dict()
                     return {f"optimizer_{i}": opt.state_dict() for i, opt in enumerate(self._optimizers)}
-                    
+
                 def load_state_dict(self, state_dict):
                     if len(self._optimizers) == 1:
                         self._optimizers[0].load_state_dict(state_dict)
                     else:
                         for i, opt in enumerate(self._optimizers):
                             opt.load_state_dict(state_dict[f"optimizer_{i}"])
-                            
+
                 def init_cache_state_dict(self):
                     # For fault tolerance - not implemented yet
                     pass
-            
+
             # Create LR schedulers container
             class LRSchedulersContainer:
                 def __init__(self, schedulers):
                     self._schedulers = schedulers if isinstance(schedulers, list) else [schedulers]
-                    
+
                 def state_dict(self):
                     if len(self._schedulers) == 1:
                         return self._schedulers[0].state_dict()
                     return {f"scheduler_{i}": sched.state_dict() for i, sched in enumerate(self._schedulers)}
-                    
+
                 def load_state_dict(self, state_dict):
                     if len(self._schedulers) == 1:
                         self._schedulers[0].load_state_dict(state_dict)
                     else:
                         for i, sched in enumerate(self._schedulers):
                             sched.load_state_dict(state_dict[f"scheduler_{i}"])
-            
+
             optimizers_container = OptimizersContainer(optimizers)
             lr_schedulers_container = LRSchedulersContainer(lr_schedulers)
-            
+
             # Initialize checkpoint manager
             checkpoint_manager = CheckpointManager(
                 dataloader=dataloader,
@@ -4768,12 +4785,12 @@ class Accelerator:
                 lr_schedulers=lr_schedulers_container,
                 states=states,
                 job_config=job_config,
-                ft_manager=ft_manager
+                ft_manager=ft_manager,
             )
-            
+
             logger.info(f"TorchTitan CheckpointManager initialized with folder: {plugin.checkpoint_folder}")
             return checkpoint_manager
-            
+
         except ImportError as e:
             logger.warning(f"TorchTitan checkpointing not available: {e}")
             return None
@@ -4784,21 +4801,24 @@ class Accelerator:
     def save_torchtitan_checkpoint(self, step: int, force: bool = False):
         """
         Save a checkpoint using TorchTitan's checkpointing system.
-        
+
         Args:
             step (int): Current training step
             force (bool): Whether to force save regardless of interval
         """
-        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+        if hasattr(self, "_torchtitan_checkpoint_manager") and self._torchtitan_checkpoint_manager is not None:
             try:
                 # Update training state
-                if hasattr(self._torchtitan_checkpoint_manager, 'states') and 'train_state' in self._torchtitan_checkpoint_manager.states:
-                    self._torchtitan_checkpoint_manager.states['train_state'].step = step
-                
+                if (
+                    hasattr(self._torchtitan_checkpoint_manager, "states")
+                    and "train_state" in self._torchtitan_checkpoint_manager.states
+                ):
+                    self._torchtitan_checkpoint_manager.states["train_state"].step = step
+
                 # Save checkpoint
                 self._torchtitan_checkpoint_manager.save(step, force=force)
                 logger.info(f"TorchTitan checkpoint saved at step {step}")
-                
+
             except Exception as e:
                 logger.error(f"Failed to save TorchTitan checkpoint: {e}")
         else:
@@ -4807,27 +4827,30 @@ class Accelerator:
     def load_torchtitan_checkpoint(self, step: int = -1) -> bool:
         """
         Load a checkpoint using TorchTitan's checkpointing system.
-        
+
         Args:
             step (int): Step to load (-1 for latest)
-            
+
         Returns:
             bool: Whether checkpoint was loaded successfully
         """
-        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+        if hasattr(self, "_torchtitan_checkpoint_manager") and self._torchtitan_checkpoint_manager is not None:
             try:
                 success = self._torchtitan_checkpoint_manager.load(step=step)
                 if success:
                     # Get loaded training state
-                    if hasattr(self._torchtitan_checkpoint_manager, 'states') and 'train_state' in self._torchtitan_checkpoint_manager.states:
-                        loaded_step = self._torchtitan_checkpoint_manager.states['train_state'].step
+                    if (
+                        hasattr(self._torchtitan_checkpoint_manager, "states")
+                        and "train_state" in self._torchtitan_checkpoint_manager.states
+                    ):
+                        loaded_step = self._torchtitan_checkpoint_manager.states["train_state"].step
                         logger.info(f"TorchTitan checkpoint loaded from step {loaded_step}")
                     else:
                         logger.info("TorchTitan checkpoint loaded successfully")
                 else:
                     logger.info("No TorchTitan checkpoint found to load")
                 return success
-                
+
             except Exception as e:
                 logger.error(f"Failed to load TorchTitan checkpoint: {e}")
                 return False
@@ -4838,14 +4861,17 @@ class Accelerator:
     def get_torchtitan_checkpoint_step(self) -> int:
         """
         Get the current training step from TorchTitan checkpoint manager.
-        
+
         Returns:
             int: Current training step
         """
-        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+        if hasattr(self, "_torchtitan_checkpoint_manager") and self._torchtitan_checkpoint_manager is not None:
             try:
-                if hasattr(self._torchtitan_checkpoint_manager, 'states') and 'train_state' in self._torchtitan_checkpoint_manager.states:
-                    return self._torchtitan_checkpoint_manager.states['train_state'].step
+                if (
+                    hasattr(self._torchtitan_checkpoint_manager, "states")
+                    and "train_state" in self._torchtitan_checkpoint_manager.states
+                ):
+                    return self._torchtitan_checkpoint_manager.states["train_state"].step
             except Exception as e:
                 logger.warning(f"Failed to get TorchTitan checkpoint step: {e}")
         return 0
@@ -4854,7 +4880,7 @@ class Accelerator:
         """
         Wait for TorchTitan checkpoint staging to complete (for async checkpointing).
         """
-        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+        if hasattr(self, "_torchtitan_checkpoint_manager") and self._torchtitan_checkpoint_manager is not None:
             try:
                 self._torchtitan_checkpoint_manager.maybe_wait_for_staging()
             except Exception as e:
@@ -4864,7 +4890,7 @@ class Accelerator:
         """
         Properly close the TorchTitan checkpoint manager and cleanup resources.
         """
-        if hasattr(self, '_torchtitan_checkpoint_manager') and self._torchtitan_checkpoint_manager is not None:
+        if hasattr(self, "_torchtitan_checkpoint_manager") and self._torchtitan_checkpoint_manager is not None:
             try:
                 self._torchtitan_checkpoint_manager.close()
                 logger.info("TorchTitan checkpoint manager closed")

@@ -2868,23 +2868,23 @@ class TorchTitanPlugin:
 
     job_config: Optional[Union[str, dict]] = None
     model_name: str = "llama3"
-    
+
     # Parallelism configuration
     tp_degree: int = 1
     pp_degree: int = 1
     dp_degree: Optional[int] = None
-    
+
     # FSDP configuration
     enable_fsdp: bool = False
     fsdp_sharding_strategy: str = "FULL_SHARD"
-    fsdp_backward_prefetch: str = "BACKWARD_PRE" 
+    fsdp_backward_prefetch: str = "BACKWARD_PRE"
     fsdp_mixed_precision_policy: Optional[dict] = None
     fsdp_cpu_offload: bool = False
-    
+
     # Memory optimization
     activation_checkpointing: bool = False
     selective_checkpointing_layers: Optional[list[str]] = None
-    
+
     # Compilation
     compile_model: bool = False
     compile_config: Optional[dict] = None
@@ -2908,7 +2908,7 @@ class TorchTitanPlugin:
             raise ValueError(f"tp_degree must be >= 1, got {self.tp_degree}")
         if self.pp_degree < 1:
             raise ValueError(f"pp_degree must be >= 1, got {self.pp_degree}")
-        
+
         # Environment variable configuration
         env_prefix = "TORCHTITAN_"
         if self.tp_degree == 1:
@@ -2917,24 +2917,30 @@ class TorchTitanPlugin:
             self.pp_degree = int(os.environ.get(env_prefix + "PP_DEGREE", 1))
         if self.dp_degree is None:
             self.dp_degree = int(os.environ.get(env_prefix + "DP_DEGREE", 0))  # 0 means auto-calculate
-            
+
         if self.enable_fsdp is False:
             self.enable_fsdp = str_to_bool(os.environ.get(env_prefix + "ENABLE_FSDP", "False")) == 1
         if self.activation_checkpointing is False:
-            self.activation_checkpointing = str_to_bool(os.environ.get(env_prefix + "ACTIVATION_CHECKPOINTING", "False")) == 1
+            self.activation_checkpointing = (
+                str_to_bool(os.environ.get(env_prefix + "ACTIVATION_CHECKPOINTING", "False")) == 1
+            )
         if self.compile_model is False:
             self.compile_model = str_to_bool(os.environ.get(env_prefix + "COMPILE_MODEL", "False")) == 1
 
         # Validate FSDP sharding strategy (only if FSDP is enabled)
         valid_fsdp_strategies = ["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD"]
         if self.enable_fsdp and self.fsdp_sharding_strategy not in valid_fsdp_strategies:
-            raise ValueError(f"fsdp_sharding_strategy must be one of {valid_fsdp_strategies}, got {self.fsdp_sharding_strategy}")
-            
+            raise ValueError(
+                f"fsdp_sharding_strategy must be one of {valid_fsdp_strategies}, got {self.fsdp_sharding_strategy}"
+            )
+
         # Validate FSDP backward prefetch (only if FSDP is enabled)
-        valid_prefetch_strategies = ["BACKWARD_PRE", "BACKWARD_POST", "NO_PREFETCH"]  
+        valid_prefetch_strategies = ["BACKWARD_PRE", "BACKWARD_POST", "NO_PREFETCH"]
         if self.enable_fsdp and self.fsdp_backward_prefetch not in valid_prefetch_strategies:
-            raise ValueError(f"fsdp_backward_prefetch must be one of {valid_prefetch_strategies}, got {self.fsdp_backward_prefetch}")
-            
+            raise ValueError(
+                f"fsdp_backward_prefetch must be one of {valid_prefetch_strategies}, got {self.fsdp_backward_prefetch}"
+            )
+
         # Set default values when FSDP is disabled
         if not self.enable_fsdp:
             if self.fsdp_sharding_strategy is None:
@@ -2951,33 +2957,35 @@ class TorchTitanPlugin:
                     "tp_size": self.tp_degree,
                     "pp_size": self.pp_degree,
                     "dp_size": self.dp_degree,
-                    "enable_fsdp": self.enable_fsdp
-                }
+                    "enable_fsdp": self.enable_fsdp,
+                },
             }
         elif isinstance(self.job_config, dict):
             # Update parallelism config in existing job_config
             if "parallelism" not in self.job_config:
                 self.job_config["parallelism"] = {}
-            self.job_config["parallelism"].update({
-                "tp_size": self.tp_degree,
-                "pp_size": self.pp_degree,
-                "dp_size": self.dp_degree,
-                "enable_fsdp": self.enable_fsdp
-            })
-            
+            self.job_config["parallelism"].update(
+                {
+                    "tp_size": self.tp_degree,
+                    "pp_size": self.pp_degree,
+                    "dp_size": self.dp_degree,
+                    "enable_fsdp": self.enable_fsdp,
+                }
+            )
+
         # Set up compile config defaults
         if self.compile_model and self.compile_config is None:
             self.compile_config = {
                 "backend": "inductor",
                 "mode": "reduce-overhead",
                 "fullgraph": False,
-                "dynamic": False
+                "dynamic": False,
             }
 
     def get_world_size_requirements(self) -> int:
         """
         Calculate the minimum world size required for the parallelism configuration.
-        
+
         Returns:
             int: Minimum required world size
         """
@@ -2986,14 +2994,14 @@ class TorchTitanPlugin:
         else:
             # If dp_degree is auto (None or 0), just return tp * pp
             return self.tp_degree * self.pp_degree
-    
+
     def validate_world_size(self, world_size: int) -> None:
         """
         Validate that the world size is compatible with parallelism configuration.
-        
+
         Args:
             world_size (int): The actual world size
-            
+
         Raises:
             ValueError: If world size is incompatible
         """
@@ -3019,47 +3027,47 @@ class TorchTitanPlugin:
     def get_fsdp_config(self) -> dict:
         """
         Get FSDP configuration dictionary.
-        
+
         Returns:
             dict: FSDP configuration
         """
         if not self.enable_fsdp:
             return {}
-            
+
         config = {
             "sharding_strategy": self.fsdp_sharding_strategy,
             "backward_prefetch": self.fsdp_backward_prefetch,
             "cpu_offload": self.fsdp_cpu_offload,
         }
-        
+
         if self.fsdp_mixed_precision_policy:
             config["mixed_precision_policy"] = self.fsdp_mixed_precision_policy
-            
+
         return config
-        
+
     def get_checkpointing_config(self) -> dict:
         """
         Get activation checkpointing configuration.
-        
+
         Returns:
             dict: Checkpointing configuration
         """
         if not self.activation_checkpointing:
             return {}
-            
+
         config = {"enabled": True}
         if self.selective_checkpointing_layers:
             config["selective_layers"] = self.selective_checkpointing_layers
-            
+
         return config
 
     def get_device_mesh_config(self, world_size: int) -> tuple[int, int, int]:
         """
         Get device mesh configuration for multi-dimensional parallelism.
-        
+
         Args:
             world_size (int): Total number of processes
-            
+
         Returns:
             tuple: (dp_size, tp_size, pp_size)
         """
