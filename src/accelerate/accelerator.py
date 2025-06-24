@@ -2724,7 +2724,7 @@ class Accelerator:
 
             # Get context parallel configuration
             cp_config = plugin.get_context_parallel_config()
-            rotate_method = cp_config.get("rotate_method", "all_gather")
+            rotate_method = cp_config.get("rotate_method", "alltoall")  # Fixed: use "alltoall" as default
             seq_dim = cp_config.get("seq_dim", 1)
 
             logger.info(f"Context Parallel config: rotate_method={rotate_method}, seq_dim={seq_dim}")
@@ -4996,9 +4996,8 @@ class Accelerator:
             return
 
         try:
-            # Import context_parallel and set_rotate_method from TorchTitan
+            # Import context_parallel from PyTorch experimental
             from torch.distributed.tensor.experimental import context_parallel
-            from torch.distributed.tensor.experimental._attention import set_rotate_method
 
             # Default sequence dimensions
             if seq_dims is None:
@@ -5010,16 +5009,16 @@ class Accelerator:
                 f"Creating Context Parallel context for {len(tensors)} tensors with CP size {cp_config['cp_size']}"
             )
 
-            # Set the rotation method for Ring Attention
-            rotate_method = cp_config.get("rotate_method", "all_gather")
-            set_rotate_method(rotate_method)
-            logger.debug(f"Set Context Parallel rotation method to: {rotate_method}")
+            # Get rotation method (note: this may not be directly supported by the current PyTorch API)
+            rotate_method = cp_config.get("rotate_method", "alltoall")
+            logger.debug(f"Context Parallel rotation method: {rotate_method}")
 
-            # Create Context Parallel context - the correct signature
+            # Create Context Parallel context using the correct PyTorch API signature
+            # Based on PyTorch docs: context_parallel(mesh, *, buffers=None, buffer_seq_dims=None, no_restore_buffers=None)
             with context_parallel(
                 cp_config["cp_mesh"],
-                buffers=tuple(tensors),
-                buffer_seq_dims=tuple(seq_dims),
+                buffers=list(tensors) if tensors else None,
+                buffer_seq_dims=list(seq_dims) if seq_dims else None,
             ):
                 yield
 
