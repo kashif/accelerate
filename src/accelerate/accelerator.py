@@ -4996,8 +4996,9 @@ class Accelerator:
             return
 
         try:
-            # Import context_parallel from TorchTitan
-            from torch.distributed.tensor.experimental._attention import context_parallel
+            # Import context_parallel and set_rotate_method from TorchTitan
+            from torch.distributed.tensor.experimental import context_parallel
+            from torch.distributed.tensor.experimental._attention import set_rotate_method
 
             # Default sequence dimensions
             if seq_dims is None:
@@ -5005,21 +5006,21 @@ class Accelerator:
             elif len(seq_dims) != len(tensors):
                 raise ValueError(f"seq_dims length ({len(seq_dims)}) must match number of tensors ({len(tensors)})")
 
-            # Create Context Parallel context
-            context_parallel_ctx = context_parallel(
-                cp_mesh=cp_config["cp_mesh"],
-                cp_buffers=list(tensors),
-                cp_seq_dims=seq_dims,
-                cp_no_restore_buffers=set(tensors),  # Don't restore tensors after computation
-                cp_rotate_method=cp_config["rotate_method"],
-            )
-
             logger.debug(
-                f"Created Context Parallel context for {len(tensors)} tensors with CP size {cp_config['cp_size']}"
+                f"Creating Context Parallel context for {len(tensors)} tensors with CP size {cp_config['cp_size']}"
             )
 
-            # Yield the context
-            with context_parallel_ctx:
+            # Set the rotation method for Ring Attention
+            rotate_method = cp_config.get("rotate_method", "all_gather")
+            set_rotate_method(rotate_method)
+            logger.debug(f"Set Context Parallel rotation method to: {rotate_method}")
+
+            # Create Context Parallel context - the correct signature
+            with context_parallel(
+                cp_config["cp_mesh"],
+                buffers=tuple(tensors),
+                buffer_seq_dims=tuple(seq_dims),
+            ):
                 yield
 
         except ImportError:

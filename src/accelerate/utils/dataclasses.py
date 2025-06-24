@@ -2836,8 +2836,8 @@ class TorchTitanPlugin:
             FSDP mixed precision policy configuration.
         fsdp_cpu_offload (`bool`, defaults to `False`):
             Whether to enable FSDP CPU parameter offloading.
-        context_parallel_rotate_method (`str`, defaults to `"all_gather"`):
-            Context parallel rotation method. Options: "all_gather", "send_recv".
+        context_parallel_rotate_method (`str`, defaults to `"alltoall"`):
+            Context parallel rotation method. Options: "alltoall", "send_recv".
         context_parallel_seq_dim (`int`, defaults to `1`):
             Sequence dimension to shard for context parallelism (typically dimension 1 for seq_len).
         activation_checkpointing (`bool`, defaults to `False`):
@@ -2889,7 +2889,7 @@ class TorchTitanPlugin:
     fsdp_cpu_offload: bool = False
 
     # Context Parallel configuration
-    context_parallel_rotate_method: str = "all_gather"  # "all_gather" or "send_recv"
+    context_parallel_rotate_method: str = "alltoall"  # "alltoall" or "send_recv"
     context_parallel_seq_dim: int = 1  # Sequence dimension to shard
 
     # Memory optimization
@@ -2943,11 +2943,11 @@ class TorchTitanPlugin:
             self.compile_model = str_to_bool(os.environ.get(env_prefix + "COMPILE_MODEL", "False")) == 1
 
         # Context Parallel environment variables
-        if self.context_parallel_rotate_method == "all_gather":
-            self.context_parallel_rotate_method = os.environ.get(env_prefix + "CP_ROTATE_METHOD", "all_gather")
+        if self.context_parallel_rotate_method == "alltoall":
+            self.context_parallel_rotate_method = os.environ.get(env_prefix + "CP_ROTATE_METHOD", "alltoall")
 
         # Validate Context Parallel rotation method
-        valid_cp_methods = ["all_gather", "send_recv"]
+        valid_cp_methods = ["alltoall", "send_recv"]
         if self.context_parallel_rotate_method not in valid_cp_methods:
             raise ValueError(
                 f"context_parallel_rotate_method must be one of {valid_cp_methods}, got {self.context_parallel_rotate_method}"
