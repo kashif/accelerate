@@ -20,11 +20,12 @@ rendered properly in your Markdown viewer.
 TorchTitan implements several key features for large-scale model training:
 
 1. **Multi-dimensional Parallelism**: Combines tensor parallelism, pipeline parallelism, and data parallelism
-2. **Memory Optimization**: Advanced memory management and optimization strategies  
-3. **Native PyTorch Integration**: Built using native PyTorch distributed primitives
-4. **Flexible Configuration**: Highly configurable training setup via job config files
-5. **Performance Optimization**: Optimized for large-scale training workloads
-6. **Model Support**: Support for popular model architectures like Llama, Gemma, and more
+2. **FSDP Integration**: Advanced Fully Sharded Data Parallelism support with flexible configurations
+3. **Memory Optimization**: Advanced memory management including activation checkpointing and compilation
+4. **Native PyTorch Integration**: Built using native PyTorch distributed primitives
+5. **Flexible Configuration**: Highly configurable training setup via job config files or plugin parameters
+6. **Advanced Checkpointing**: Comprehensive checkpoint management with async support and fault tolerance
+7. **Model Support**: Support for popular model architectures like Llama, Gemma, and more
 
 TorchTitan is designed primarily for training large language models and provides the infrastructure needed to scale training across multiple nodes and GPUs efficiently.
 
@@ -34,20 +35,27 @@ Accelerate integrates [TorchTitan](https://github.com/pytorch/torchtitan) to pro
 
 Training:
 
-1. **TorchTitan Plugin Integration**: Accelerate provides a `TorchTitanPlugin` that allows you to configure and use TorchTitan's features within your existing Accelerate training scripts.
+1. **TorchTitan Plugin Integration**: Accelerate provides a comprehensive `TorchTitanPlugin` that allows you to configure and use TorchTitan's features within your existing Accelerate training scripts.
 
-2. **Distributed Training Support**: Full integration with TorchTitan's multi-dimensional parallelism:
+2. **Multi-dimensional Parallelism**: Full integration with TorchTitan's parallelism strategies:
    - **Tensor Parallelism (TP)**: Distributes model weights across multiple GPUs
-   - **Pipeline Parallelism (PP)**: Splits model layers across different GPUs
+   - **Pipeline Parallelism (PP)**: Splits model layers across different GPUs  
    - **Data Parallelism (DP)**: Replicates model across multiple devices for data parallelism
-   - **Sequence Parallelism**: Distributes sequence computations across devices
+   - **FSDP Integration**: Advanced Fully Sharded Data Parallelism with configurable sharding strategies
 
 3. **Memory Optimization**: Integration with TorchTitan's memory optimization features:
-   - Gradient checkpointing integration
-   - Memory-efficient attention mechanisms
-   - Dynamic memory management
+   - Activation checkpointing with selective layer targeting
+   - Model compilation with torch.compile integration
+   - Mixed precision training support
+   - CPU offloading capabilities
 
-4. **Model Architecture Support**: Support for TorchTitan's optimized model implementations:
+4. **Advanced Checkpointing**: Comprehensive checkpoint management:
+   - Asynchronous checkpointing for improved performance
+   - Configurable checkpoint intervals and retention policies
+   - Fault tolerance and recovery mechanisms
+   - Support for loading partial checkpoints
+
+5. **Model Architecture Support**: Support for TorchTitan's optimized model implementations:
    - Llama model family (Llama2, Llama3, Code Llama)
    - Gemma models
    - Custom transformer architectures
@@ -58,7 +66,7 @@ Training:
 
 ### Accelerate TorchTitan Plugin
 
-The easiest way to get started with TorchTitan in Accelerate is through the `TorchTitanPlugin`. You can configure TorchTitan in two ways:
+The easiest way to get started with TorchTitan in Accelerate is through the `TorchTitanPlugin`. You can configure TorchTitan in several ways:
 
 #### Method 1: Environment Variable
 
@@ -81,68 +89,91 @@ from accelerate import Accelerator
 from accelerate.utils import TorchTitanPlugin
 
 # Basic TorchTitan setup
-torchtitan_plugin = TorchTitanPlugin(model_name="llama3")
+torchtitan_plugin = TorchTitanPlugin(
+    model_name="llama3",
+    tp_degree=2,
+    pp_degree=1,
+    enable_fsdp=True,
+    activation_checkpointing=True
+)
 accelerator = Accelerator(torchtitan_plugin=torchtitan_plugin)
 
 # Your training code here
 model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 ```
 
-### TorchTitan Job Configuration
+### Comprehensive TorchTitan Configuration
 
-For more advanced configurations, you can use TorchTitan's job configuration system:
+For more advanced configurations, you can use TorchTitan's comprehensive configuration system:
 
 ```python
 from accelerate import Accelerator
 from accelerate.utils import TorchTitanPlugin
 
 # Advanced TorchTitan configuration
-torchtitan_config = {
-    "training": {
-        "batch_size": 4,
-        "seq_len": 2048,
-        "gradient_accumulation_steps": 8,
-        "max_steps": 10000,
-        "learning_rate": 3e-4,
-        "warmup_steps": 2000
-    },
-    "model": {
-        "name": "llama3",
-        "vocab_size": 32000,
-        "embed_dim": 4096,
-        "num_layers": 32,
-        "num_heads": 32,
-        "intermediate_size": 11008
-    },
-    "parallelism": {
-        "tensor_parallel": 2,
-        "pipeline_parallel": 1,
-        "data_parallel": 4,
-        "sequence_parallel": False
-    },
-    "optimizer": {
-        "name": "adamw",
-        "lr": 3e-4,
-        "weight_decay": 0.1,
-        "beta1": 0.9,
-        "beta2": 0.95,
-        "eps": 1e-8
-    },
-    "checkpointing": {
-        "save_interval": 1000,
-        "save_dir": "./checkpoints",
-        "resume_from_checkpoint": null
-    },
-    "memory": {
-        "gradient_checkpointing": True,
-        "activation_checkpointing": True,
-        "cpu_offload": False
-    }
-}
-
 torchtitan_plugin = TorchTitanPlugin(
-    job_config=torchtitan_config,
-    model_name="llama3"
+    # Basic model configuration
+    model_name="llama3",
+    
+    # Parallelism configuration
+    tp_degree=4,           # Tensor parallelism degree
+    pp_degree=2,           # Pipeline parallelism degree
+    dp_degree=None,        # Auto-calculated data parallelism
+    
+    # FSDP configuration
+    enable_fsdp=True,
+    fsdp_sharding_strategy="FULL_SHARD",  # Options: "FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD"
+    fsdp_backward_prefetch="BACKWARD_PRE", # Options: "BACKWARD_PRE", "BACKWARD_POST", "NO_PREFETCH"
+    fsdp_cpu_offload=False,
+    fsdp_mixed_precision_policy={
+        "param_dtype": "bfloat16",
+        "reduce_dtype": "float32",
+        "buffer_dtype": "float32"
+    },
+    
+    # Memory optimization
+    activation_checkpointing=True,
+    selective_checkpointing_layers=["TransformerBlock"],  # Target specific layers
+    
+    # Model compilation
+    compile_model=True,
+    compile_config={
+        "backend": "inductor",
+        "mode": "reduce-overhead",
+        "fullgraph": False,
+        "dynamic": False
+    },
+    
+    # Advanced checkpointing
+    enable_checkpoint=True,
+    checkpoint_folder="./torchtitan_checkpoints",
+    checkpoint_interval=500,
+    checkpoint_async_mode="async_with_pinned_mem",  # Options: "disabled", "async", "async_with_pinned_mem"
+    checkpoint_keep_latest_k=3,
+    checkpoint_export_dtype="float32",
+    checkpoint_enable_first_step=True,
+    checkpoint_model_weights_only_at_end=False,
+    checkpoint_initial_load_path=None,
+    
+    # Job configuration (can also be a path to TOML file)
+    job_config={
+        "training": {
+            "batch_size": 4,
+            "seq_len": 2048,
+            "gradient_accumulation_steps": 8,
+            "max_steps": 10000,
+            "learning_rate": 3e-4,
+            "warmup_steps": 2000
+        },
+        "model": {
+            "name": "llama3",
+            "vocab_size": 32000,
+            "embed_dim": 4096,
+            "num_layers": 32,
+            "num_heads": 32,
+            "intermediate_size": 11008
+        }
+    }
 )
 
 accelerator = Accelerator(
@@ -163,7 +194,9 @@ from accelerate.utils import TorchTitanPlugin
 # Load config from TOML file
 torchtitan_plugin = TorchTitanPlugin(
     job_config="path/to/torchtitan_config.toml",
-    model_name="llama3"
+    model_name="llama3",
+    tp_degree=2,
+    enable_fsdp=True
 )
 
 accelerator = Accelerator(torchtitan_plugin=torchtitan_plugin)
@@ -189,10 +222,10 @@ num_heads = 32
 intermediate_size = 11008
 
 [parallelism]
-tensor_parallel = 2
-pipeline_parallel = 1
-data_parallel = 4
-sequence_parallel = false
+tp_size = 2
+pp_size = 1
+dp_size = 4
+enable_fsdp = true
 
 [optimizer]
 name = "adamw"
@@ -203,14 +236,17 @@ beta2 = 0.95
 eps = 1e-8
 
 [checkpointing]
-save_interval = 1000
-save_dir = "./checkpoints"
-resume_from_checkpoint = ""
+enable = true
+folder = "./torchtitan_checkpoints"
+interval = 1000
+async_mode = "async_with_pinned_mem"
+keep_latest_k = 2
+export_dtype = "float32"
 
 [memory]
-gradient_checkpointing = true
 activation_checkpointing = true
-cpu_offload = false
+selective_checkpointing_layers = ["TransformerBlock"]
+compile_model = true
 ```
 
 ## Complete Training Example
@@ -240,31 +276,40 @@ class SimpleDataset(Dataset):
 
 def main():
     # TorchTitan configuration
-    torchtitan_config = {
-        "training": {
-            "batch_size": 2,
-            "seq_len": 512,
-            "gradient_accumulation_steps": 4,
-            "max_steps": 1000
-        },
-        "model": {
-            "name": "llama3",
-            "vocab_size": 32000,
-            "embed_dim": 1024,
-            "num_layers": 12,
-            "num_heads": 16
-        },
-        "parallelism": {
-            "tensor_parallel": 1,
-            "pipeline_parallel": 1,
-            "data_parallel": 1
-        }
-    }
-    
-    # Initialize TorchTitan plugin
     torchtitan_plugin = TorchTitanPlugin(
-        job_config=torchtitan_config,
-        model_name="llama3"
+        model_name="llama3",
+        
+        # Parallelism settings
+        tp_degree=2,
+        pp_degree=1,
+        enable_fsdp=True,
+        fsdp_sharding_strategy="FULL_SHARD",
+        
+        # Memory optimization
+        activation_checkpointing=True,
+        compile_model=True,
+        
+        # Checkpointing
+        checkpoint_interval=100,
+        checkpoint_async_mode="async",
+        checkpoint_keep_latest_k=2,
+        
+        # Job configuration
+        job_config={
+            "training": {
+                "batch_size": 2,
+                "seq_len": 512,
+                "gradient_accumulation_steps": 4,
+                "max_steps": 1000
+            },
+            "model": {
+                "name": "llama3",
+                "vocab_size": 32000,
+                "embed_dim": 1024,
+                "num_layers": 12,
+                "num_heads": 16
+            }
+        }
     )
     
     # Initialize Accelerator with TorchTitan
@@ -299,7 +344,7 @@ def main():
         model, optimizer, dataloader, scheduler
     )
     
-    # Training loop
+    # Training loop with checkpointing
     model.train()
     for step, batch in enumerate(dataloader):
         if step >= 100:  # Limit for example
@@ -314,9 +359,15 @@ def main():
             scheduler.step()
             optimizer.zero_grad()
         
+        # Automatic checkpointing based on plugin configuration
+        if step % 50 == 0:
+            accelerator.save_torchtitan_checkpoint(step)
+        
         if step % 10 == 0:
             accelerator.print(f"Step {step}, Loss: {loss.item():.4f}")
     
+    # Save final checkpoint
+    accelerator.save_torchtitan_checkpoint(step, force=True)
     accelerator.print("Training completed!")
 
 if __name__ == "__main__":
@@ -330,54 +381,88 @@ if __name__ == "__main__":
 TorchTitan supports multiple parallelism strategies that can be combined:
 
 ```python
-parallelism_config = {
-    "tensor_parallel": 4,      # Split model weights across 4 GPUs
-    "pipeline_parallel": 2,    # Split model layers across 2 stages  
-    "data_parallel": 2,        # Replicate model across 2 data parallel groups
-    "sequence_parallel": True  # Enable sequence parallelism for memory efficiency
-}
+# Comprehensive parallelism setup
+torchtitan_plugin = TorchTitanPlugin(
+    tp_degree=4,           # Split model weights across 4 GPUs
+    pp_degree=2,           # Split model layers across 2 pipeline stages  
+    dp_degree=None,        # Auto-calculate: world_size / (tp_degree * pp_degree)
+    
+    # FSDP configuration
+    enable_fsdp=True,
+    fsdp_sharding_strategy="FULL_SHARD",    # Full parameter sharding
+    fsdp_backward_prefetch="BACKWARD_PRE",  # Prefetch strategy
+    fsdp_cpu_offload=False,                 # Keep parameters on GPU
+    fsdp_mixed_precision_policy={
+        "param_dtype": "bfloat16",
+        "reduce_dtype": "float32",
+        "buffer_dtype": "bfloat16"
+    }
+)
 ```
 
 ### Memory Optimization
 
 ```python
-memory_config = {
-    "gradient_checkpointing": True,    # Save memory by recomputing activations
-    "activation_checkpointing": True,  # Checkpoint specific layers
-    "cpu_offload": False,             # Offload parameters to CPU
-    "mixed_precision": "bf16"         # Use bfloat16 for memory efficiency
-}
+# Advanced memory optimization
+torchtitan_plugin = TorchTitanPlugin(
+    # Activation checkpointing
+    activation_checkpointing=True,
+    selective_checkpointing_layers=["TransformerBlock", "LlamaDecoderLayer"],
+    
+    # Model compilation
+    compile_model=True,
+    compile_config={
+        "backend": "inductor",      # Compilation backend
+        "mode": "reduce-overhead",  # Compilation mode
+        "fullgraph": False,         # Allow graph breaks
+        "dynamic": False            # Static shapes
+    },
+    
+    # FSDP CPU offloading
+    fsdp_cpu_offload=True
+)
 ```
 
-### Model-Specific Settings
+### Advanced Checkpointing
 
 ```python
-# Llama model configuration
-llama_config = {
-    "model": {
-        "name": "llama3",
-        "vocab_size": 32000,
-        "embed_dim": 4096,
-        "num_layers": 32,
-        "num_heads": 32,
-        "intermediate_size": 11008,
-        "max_seq_len": 2048,
-        "rope_theta": 10000.0
-    }
-}
+# Comprehensive checkpointing configuration
+torchtitan_plugin = TorchTitanPlugin(
+    enable_checkpoint=True,
+    checkpoint_folder="./distributed_checkpoints",
+    checkpoint_interval=500,
+    
+    # Async checkpointing for performance
+    checkpoint_async_mode="async_with_pinned_mem",  # Options: "disabled", "async", "async_with_pinned_mem"
+    
+    # Checkpoint management
+    checkpoint_keep_latest_k=3,                     # Keep 3 latest checkpoints
+    checkpoint_enable_first_step=True,              # Save checkpoint at step 0
+    checkpoint_export_dtype="float32",              # Export precision
+    checkpoint_model_weights_only_at_end=False,     # Save full state at end
+    
+    # Loading configuration
+    checkpoint_initial_load_path="./pretrained_checkpoint",
+    checkpoint_initial_load_model_weights_only=False,
+    checkpoint_exclude_from_loading=["optimizer_states"]
+)
 
-# Gemma model configuration  
-gemma_config = {
-    "model": {
-        "name": "gemma",
-        "vocab_size": 256000,
-        "embed_dim": 3072,
-        "num_layers": 28,
-        "num_heads": 16,
-        "num_kv_heads": 16,
-        "intermediate_size": 24576
-    }
-}
+# Manual checkpointing in training loop
+accelerator = Accelerator(torchtitan_plugin=torchtitan_plugin)
+
+# In training loop
+for step, batch in enumerate(dataloader):
+    # ... training code ...
+    
+    # Manual checkpoint save
+    if step % 1000 == 0:
+        accelerator.save_torchtitan_checkpoint(step, force=True)
+    
+    # Load checkpoint if needed
+    if should_resume:
+        loaded = accelerator.load_torchtitan_checkpoint(step=-1)  # Load latest
+        if loaded:
+            accelerator.print(f"Resumed from step {accelerator.get_torchtitan_checkpoint_step()}")
 ```
 
 ## Environment Variables
@@ -388,19 +473,22 @@ TorchTitan integration supports several environment variables for configuration:
 # Enable TorchTitan
 export ACCELERATE_USE_TORCHTITAN=true
 
-# TorchTitan specific settings
+# Parallelism settings
+export TORCHTITAN_TP_DEGREE=2
+export TORCHTITAN_PP_DEGREE=1
+export TORCHTITAN_DP_DEGREE=4  # 0 means auto-calculate
+
+# FSDP settings
+export TORCHTITAN_ENABLE_FSDP=true
+
+# Memory optimization
+export TORCHTITAN_ACTIVATION_CHECKPOINTING=true
+export TORCHTITAN_COMPILE_MODEL=true
+
+# Other TorchTitan specific settings
 export TORCHTITAN_CONFIG_PATH="/path/to/config.toml"
 export TORCHTITAN_MODEL_NAME="llama3"
 export TORCHTITAN_CHECKPOINT_DIR="/path/to/checkpoints"
-
-# Parallelism settings
-export TORCHTITAN_TP_SIZE=2
-export TORCHTITAN_PP_SIZE=1  
-export TORCHTITAN_DP_SIZE=4
-
-# Memory optimization
-export TORCHTITAN_GRADIENT_CHECKPOINTING=true
-export TORCHTITAN_ACTIVATION_CHECKPOINTING=true
 ```
 
 ## Multi-Node Training
@@ -436,13 +524,26 @@ accelerate launch \
 - **Tensor Parallelism**: Use when model layers are too large for single GPU memory
 - **Pipeline Parallelism**: Effective for very deep models, but introduces bubble overhead
 - **Data Parallelism**: Most efficient for scaling across many GPUs
-- **Sequence Parallelism**: Helps with memory when using long sequences
+- **FSDP**: Combines benefits of data parallelism with memory efficiency
 
 ### 2. Memory Optimization
 
 ```python
-# Enable gradient checkpointing for memory savings
-torchtitan_config["memory"]["gradient_checkpointing"] = True
+# Enable comprehensive memory optimizations
+torchtitan_plugin = TorchTitanPlugin(
+    # Activation checkpointing for memory savings
+    activation_checkpointing=True,
+    selective_checkpointing_layers=["TransformerBlock"],
+    
+    # FSDP with CPU offloading
+    enable_fsdp=True,
+    fsdp_cpu_offload=True,
+    fsdp_sharding_strategy="FULL_SHARD",
+    
+    # Model compilation for efficiency
+    compile_model=True,
+    compile_config={"backend": "inductor", "mode": "reduce-overhead"}
+)
 
 # Use mixed precision training
 accelerator = Accelerator(
@@ -451,18 +552,24 @@ accelerator = Accelerator(
 )
 
 # Optimize batch size and gradient accumulation
-torchtitan_config["training"]["batch_size"] = 1  # Micro batch size
-torchtitan_config["training"]["gradient_accumulation_steps"] = 32  # Effective batch size
+job_config = {
+    "training": {
+        "batch_size": 1,                    # Micro batch size
+        "gradient_accumulation_steps": 32   # Effective batch size = 32
+    }
+}
 ```
 
-### 3. Communication Optimization
+### 3. Checkpointing Optimization
 
 ```python
-# Optimize communication for tensor parallelism
-torchtitan_config["parallelism"]["tensor_parallel_communication_backend"] = "nccl"
-
-# Enable communication overlapping
-torchtitan_config["training"]["overlap_communication"] = True
+# Async checkpointing for better performance
+torchtitan_plugin = TorchTitanPlugin(
+    checkpoint_async_mode="async_with_pinned_mem",  # Best performance
+    checkpoint_interval=1000,                       # Reasonable frequency
+    checkpoint_keep_latest_k=2,                     # Limit storage usage
+    checkpoint_export_dtype="bfloat16"              # Reduce checkpoint size
+)
 ```
 
 ## Troubleshooting
@@ -472,33 +579,60 @@ torchtitan_config["training"]["overlap_communication"] = True
 1. **Out of Memory Errors**:
    ```python
    # Reduce micro batch size
-   torchtitan_config["training"]["batch_size"] = 1
+   job_config["training"]["batch_size"] = 1
    
    # Increase gradient accumulation
-   torchtitan_config["training"]["gradient_accumulation_steps"] = 64
+   job_config["training"]["gradient_accumulation_steps"] = 64
    
-   # Enable gradient checkpointing
-   torchtitan_config["memory"]["gradient_checkpointing"] = True
+   # Enable memory optimizations
+   torchtitan_plugin = TorchTitanPlugin(
+       activation_checkpointing=True,
+       fsdp_cpu_offload=True,
+       enable_fsdp=True
+   )
    ```
 
 2. **Slow Training Speed**:
    ```python
    # Optimize parallelism configuration
-   torchtitan_config["parallelism"]["tensor_parallel"] = 2  # Reduce TP if too high
-   torchtitan_config["parallelism"]["pipeline_parallel"] = 1  # Minimize PP overhead
-   
-   # Enable communication optimizations
-   torchtitan_config["training"]["overlap_communication"] = True
+   torchtitan_plugin = TorchTitanPlugin(
+       tp_degree=2,    # Reduce TP if too high
+       pp_degree=1,    # Minimize PP overhead
+       enable_fsdp=True,
+       
+       # Enable compilation
+       compile_model=True,
+       
+       # Use async checkpointing
+       checkpoint_async_mode="async_with_pinned_mem"
+   )
    ```
 
 3. **Checkpoint Issues**:
    ```python
    # Ensure checkpoint directory is accessible to all ranks
-   torchtitan_config["checkpointing"]["save_dir"] = "/shared/checkpoints"
-   
-   # Set appropriate save intervals
-   torchtitan_config["checkpointing"]["save_interval"] = 1000
+   torchtitan_plugin = TorchTitanPlugin(
+       checkpoint_folder="/shared/checkpoints",
+       checkpoint_async_mode="async",
+       checkpoint_keep_latest_k=2
+   )
    ```
+
+### World Size Validation
+
+TorchTitan automatically validates that your parallelism configuration is compatible with the available world size:
+
+```python
+# Example: 8 GPUs total
+torchtitan_plugin = TorchTitanPlugin(
+    tp_degree=2,    # 2 GPUs for tensor parallelism
+    pp_degree=1,    # 1 GPU for pipeline parallelism
+    dp_degree=None  # Auto-calculated: 8 / (2 * 1) = 4
+)
+
+# Validation occurs automatically
+accelerator = Accelerator(torchtitan_plugin=torchtitan_plugin)
+```
 
 ### Debugging
 
@@ -509,9 +643,10 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 
 # TorchTitan will provide detailed logs about:
-# - Model partitioning
-# - Communication patterns  
-# - Memory usage
+# - Model partitioning and device mesh setup
+# - FSDP sharding strategies
+# - Checkpoint operations and async handling
+# - Memory usage and optimization
 # - Performance metrics
 ```
 
@@ -532,15 +667,9 @@ deepspeed_plugin = DeepSpeedPlugin(
 # TorchTitan equivalent
 from accelerate.utils import TorchTitanPlugin
 torchtitan_plugin = TorchTitanPlugin(
-    job_config={
-        "parallelism": {
-            "tensor_parallel": 2,
-            "data_parallel": 2
-        },
-        "memory": {
-            "cpu_offload": True
-        }
-    }
+    enable_fsdp=True,
+    fsdp_sharding_strategy="FULL_SHARD",
+    fsdp_cpu_offload=True
 )
 ```
 
@@ -554,17 +683,16 @@ fsdp_plugin = FullyShardedDataParallelPlugin(
     cpu_offload=True
 )
 
-# TorchTitan equivalent  
+# TorchTitan equivalent with additional features
 torchtitan_plugin = TorchTitanPlugin(
-    job_config={
-        "parallelism": {
-            "tensor_parallel": 1,
-            "data_parallel": 8  # Full data parallelism
-        },
-        "memory": {
-            "cpu_offload": True
-        }
-    }
+    enable_fsdp=True,
+    fsdp_sharding_strategy="FULL_SHARD",
+    fsdp_cpu_offload=True,
+    
+    # Additional TorchTitan features
+    tp_degree=2,                    # Tensor parallelism
+    activation_checkpointing=True,  # Memory optimization
+    compile_model=True              # Performance optimization
 )
 ```
 
@@ -574,6 +702,6 @@ torchtitan_plugin = TorchTitanPlugin(
 - [TorchTitan Documentation](https://github.com/pytorch/torchtitan/tree/main/docs)
 - [TorchTitan Examples](https://github.com/pytorch/torchtitan/tree/main/train_configs)
 - [Multi-dimensional Parallelism Paper](https://arxiv.org/abs/1909.08053)
-- [Sequence Parallelism Techniques](https://arxiv.org/abs/2105.13120)
+- [FSDP Paper](https://arxiv.org/abs/2304.11277)
 
-The TorchTitan integration in Accelerate provides a powerful and flexible way to scale your large language model training across multiple GPUs and nodes while maintaining the simplicity and ease of use that Accelerate is known for. 
+The TorchTitan integration in Accelerate provides a powerful and flexible way to scale your large language model training across multiple GPUs and nodes while maintaining the simplicity and ease of use that Accelerate is known for. With comprehensive checkpointing, advanced memory optimization, and multi-dimensional parallelism support, TorchTitan enables efficient training of the largest language models. 
