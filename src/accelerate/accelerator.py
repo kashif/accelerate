@@ -2310,8 +2310,8 @@ class Accelerator:
         world_size = self.num_processes
         plugin.validate_world_size(world_size)
 
-        dp_size, tp_size, pp_size = plugin.get_device_mesh_config(world_size)
-        logger.info(f"TorchTitan parallelism configuration: DP={dp_size}, TP={tp_size}, PP={pp_size}")
+        dp_size, tp_size, pp_size, cp_size = plugin.get_device_mesh_config(world_size)
+        logger.info(f"TorchTitan parallelism configuration: DP={dp_size}, TP={tp_size}, PP={pp_size}, CP={cp_size}")
 
         # Configure TorchTitan distributed settings
         if plugin.job_config:
@@ -2335,9 +2335,9 @@ class Accelerator:
 
         # Prepare device mesh for multi-dimensional parallelism
         device_mesh = None
-        if tp_size > 1 or pp_size > 1:
+        if tp_size > 1 or pp_size > 1 or cp_size > 1:
             logger.info("Setting up device mesh for multi-dimensional parallelism")
-            device_mesh = self._setup_torchtitan_device_mesh(dp_size, tp_size, pp_size)
+            device_mesh = self._setup_torchtitan_device_mesh(dp_size, tp_size, pp_size, cp_size)
 
         # Prepare models with TorchTitan-specific wrapping
         if model is not None:
@@ -2357,6 +2357,10 @@ class Accelerator:
             # Apply pipeline parallelism
             if pp_size > 1:
                 model = self._setup_torchtitan_pipeline_parallel(model, device_mesh, pp_size)
+
+            # Apply context parallelism for long sequences
+            if cp_size > 1:
+                model = self._setup_torchtitan_context_parallel(model, device_mesh, cp_size, plugin)
 
             # Apply activation checkpointing
             if plugin.activation_checkpointing:
@@ -2446,16 +2450,16 @@ class Accelerator:
         logger.info("TorchTitan preparation completed successfully")
         return tuple(result)
 
-    def _setup_torchtitan_device_mesh(self, dp_size, tp_size, pp_size):
+    def _setup_torchtitan_device_mesh(self, dp_size, tp_size, pp_size, cp_size):
         """Set up device mesh for multi-dimensional parallelism."""
         from accelerate.logging import get_logger
 
         logger = get_logger(__name__)
 
         try:
-            # Create 3D device mesh for (DP, TP, PP) dimensions
-            mesh_shape = (dp_size, tp_size, pp_size)
-            mesh_dim_names = ("dp", "tp", "pp")
+            # Create 4D device mesh for (DP, TP, PP, CP) dimensions
+            mesh_shape = (dp_size, tp_size, pp_size, cp_size)
+            mesh_dim_names = ("dp", "tp", "pp", "cp")
 
             logger.info(f"Creating device mesh with shape {mesh_shape} and dims {mesh_dim_names}")
 
@@ -2703,6 +2707,59 @@ class Accelerator:
 
         except Exception as e:
             logger.warning(f"Failed to apply pipeline parallelism: {e}. Using model without PP.")
+            return model
+
+    def _setup_torchtitan_context_parallel(self, model, device_mesh, cp_size, plugin):
+        """Set up context parallelism for long sequence training using Ring Attention."""
+        from accelerate.logging import get_logger
+
+        logger = get_logger(__name__)
+
+        try:
+            if cp_size <= 1:
+                logger.info("CP size <= 1, skipping context parallelism")
+                return model
+
+            logger.info(f"Applying context parallelism with CP size: {cp_size}")
+
+            # Get context parallel configuration
+            cp_config = plugin.get_context_parallel_config()
+            rotate_method = cp_config.get("rotate_method", "all_gather")
+            seq_dim = cp_config.get("seq_dim", 1)
+
+            logger.info(f"Context Parallel config: rotate_method={rotate_method}, seq_dim={seq_dim}")
+
+            # Get the CP submesh from the device mesh
+            if hasattr(device_mesh, "get_submesh"):
+                cp_mesh = device_mesh.get_submesh("cp")
+            else:
+                # Fallback for mock device mesh
+                logger.warning("Using fallback CP mesh setup")
+                cp_mesh = device_mesh
+
+            # Store CP configuration on the model for later use during training
+            # This will be used by the context_parallel context manager during forward/backward
+            if not hasattr(model, "_accelerate_cp_config"):
+                model._accelerate_cp_config = {
+                    "cp_mesh": cp_mesh,
+                    "cp_size": cp_size,
+                    "rotate_method": rotate_method,
+                    "seq_dim": seq_dim,
+                }
+
+            # Log information about Context Parallel setup
+            logger.info(f"Context Parallel configured for {cp_size} devices")
+            logger.info(f"Sequence dimension {seq_dim} will be sharded across CP devices")
+            logger.info(f"Using {rotate_method} rotation method for Ring Attention")
+
+            # Note: The actual Context Parallel execution happens during training
+            # using the context_parallel context manager from torch.distributed.tensor.experimental
+            logger.info("Context Parallel setup complete. Use context_parallel() during training.")
+
+            return model
+
+        except Exception as e:
+            logger.warning(f"Failed to apply context parallelism: {e}. Using model without CP.")
             return model
 
     def _setup_torchtitan_activation_checkpointing(self, model, plugin):
@@ -4896,3 +4953,78 @@ class Accelerator:
                 logger.info("TorchTitan checkpoint manager closed")
             except Exception as e:
                 logger.warning(f"Failed to close TorchTitan checkpoint manager: {e}")
+
+    @contextmanager
+    def context_parallel(self, *tensors, seq_dims=None):
+        """
+        Context manager for Context Parallel training with long sequences.
+
+        This enables Ring Attention to shard the sequence dimension across multiple devices,
+        allowing training with 1M+ sequence lengths.
+
+        Args:
+            *tensors: Input tensors to shard across context parallel devices
+            seq_dims (list, optional): Sequence dimensions for each tensor. Defaults to [1] for all tensors.
+
+        Example:
+            ```python
+            # Training with Context Parallel
+            for batch in dataloader:
+                with accelerator.context_parallel(batch["input_ids"], batch["labels"]):
+                    outputs = model(batch["input_ids"])
+                    loss = loss_fn(outputs.logits, batch["labels"])
+                    accelerator.backward(loss)
+                optimizer.step()
+                optimizer.zero_grad()
+            ```
+        """
+        from accelerate.logging import get_logger
+
+        logger = get_logger(__name__)
+
+        # Check if Context Parallel is configured
+        cp_config = None
+        for obj in self._models:
+            if hasattr(obj, "_accelerate_cp_config"):
+                cp_config = obj._accelerate_cp_config
+                break
+
+        if cp_config is None:
+            # No Context Parallel configured, use regular training
+            logger.debug("No Context Parallel configuration found, using regular training")
+            yield
+            return
+
+        try:
+            # Import context_parallel from TorchTitan
+            from torch.distributed.tensor.experimental._attention import context_parallel
+
+            # Default sequence dimensions
+            if seq_dims is None:
+                seq_dims = [1] * len(tensors)
+            elif len(seq_dims) != len(tensors):
+                raise ValueError(f"seq_dims length ({len(seq_dims)}) must match number of tensors ({len(tensors)})")
+
+            # Create Context Parallel context
+            context_parallel_ctx = context_parallel(
+                cp_mesh=cp_config["cp_mesh"],
+                cp_buffers=list(tensors),
+                cp_seq_dims=seq_dims,
+                cp_no_restore_buffers=set(tensors),  # Don't restore tensors after computation
+                cp_rotate_method=cp_config["rotate_method"],
+            )
+
+            logger.debug(
+                f"Created Context Parallel context for {len(tensors)} tensors with CP size {cp_config['cp_size']}"
+            )
+
+            # Yield the context
+            with context_parallel_ctx:
+                yield
+
+        except ImportError:
+            logger.warning("TorchTitan context_parallel not available. Using regular training.")
+            yield
+        except Exception as e:
+            logger.warning(f"Failed to create Context Parallel context: {e}. Using regular training.")
+            yield

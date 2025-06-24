@@ -2822,8 +2822,10 @@ class TorchTitanPlugin:
             Tensor parallelism degree. Must be a divisor of the world size.
         pp_degree (`int`, defaults to `1`):
             Pipeline parallelism degree. Must be a divisor of the world size.
+        cp_degree (`int`, defaults to `1`):
+            Context parallelism degree for long sequence training. Must be a divisor of the world size.
         dp_degree (`int`, defaults to `None`):
-            Data parallelism degree. If None, will be calculated automatically as world_size / (tp_degree * pp_degree).
+            Data parallelism degree. If None, will be calculated automatically as world_size / (tp_degree * pp_degree * cp_degree).
         enable_fsdp (`bool`, defaults to `False`):
             Whether to enable Fully Sharded Data Parallelism.
         fsdp_sharding_strategy (`str`, defaults to `"FULL_SHARD"`):
@@ -2834,6 +2836,10 @@ class TorchTitanPlugin:
             FSDP mixed precision policy configuration.
         fsdp_cpu_offload (`bool`, defaults to `False`):
             Whether to enable FSDP CPU parameter offloading.
+        context_parallel_rotate_method (`str`, defaults to `"all_gather"`):
+            Context parallel rotation method. Options: "all_gather", "send_recv".
+        context_parallel_seq_dim (`int`, defaults to `1`):
+            Sequence dimension to shard for context parallelism (typically dimension 1 for seq_len).
         activation_checkpointing (`bool`, defaults to `False`):
             Whether to enable activation checkpointing for memory optimization.
         selective_checkpointing_layers (`list`, defaults to `None`):
@@ -2872,6 +2878,7 @@ class TorchTitanPlugin:
     # Parallelism configuration
     tp_degree: int = 1
     pp_degree: int = 1
+    cp_degree: int = 1  # Context parallelism for long sequences
     dp_degree: Optional[int] = None
 
     # FSDP configuration
@@ -2880,6 +2887,10 @@ class TorchTitanPlugin:
     fsdp_backward_prefetch: str = "BACKWARD_PRE"
     fsdp_mixed_precision_policy: Optional[dict] = None
     fsdp_cpu_offload: bool = False
+
+    # Context Parallel configuration
+    context_parallel_rotate_method: str = "all_gather"  # "all_gather" or "send_recv"
+    context_parallel_seq_dim: int = 1  # Sequence dimension to shard
 
     # Memory optimization
     activation_checkpointing: bool = False
@@ -2908,6 +2919,8 @@ class TorchTitanPlugin:
             raise ValueError(f"tp_degree must be >= 1, got {self.tp_degree}")
         if self.pp_degree < 1:
             raise ValueError(f"pp_degree must be >= 1, got {self.pp_degree}")
+        if self.cp_degree < 1:
+            raise ValueError(f"cp_degree must be >= 1, got {self.cp_degree}")
 
         # Environment variable configuration
         env_prefix = "TORCHTITAN_"
@@ -2915,6 +2928,8 @@ class TorchTitanPlugin:
             self.tp_degree = int(os.environ.get(env_prefix + "TP_DEGREE", 1))
         if self.pp_degree == 1:
             self.pp_degree = int(os.environ.get(env_prefix + "PP_DEGREE", 1))
+        if self.cp_degree == 1:
+            self.cp_degree = int(os.environ.get(env_prefix + "CP_DEGREE", 1))
         if self.dp_degree is None:
             self.dp_degree = int(os.environ.get(env_prefix + "DP_DEGREE", 0))  # 0 means auto-calculate
 
@@ -2926,6 +2941,17 @@ class TorchTitanPlugin:
             )
         if self.compile_model is False:
             self.compile_model = str_to_bool(os.environ.get(env_prefix + "COMPILE_MODEL", "False")) == 1
+
+        # Context Parallel environment variables
+        if self.context_parallel_rotate_method == "all_gather":
+            self.context_parallel_rotate_method = os.environ.get(env_prefix + "CP_ROTATE_METHOD", "all_gather")
+
+        # Validate Context Parallel rotation method
+        valid_cp_methods = ["all_gather", "send_recv"]
+        if self.context_parallel_rotate_method not in valid_cp_methods:
+            raise ValueError(
+                f"context_parallel_rotate_method must be one of {valid_cp_methods}, got {self.context_parallel_rotate_method}"
+            )
 
         # Validate FSDP sharding strategy (only if FSDP is enabled)
         valid_fsdp_strategies = ["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD"]
@@ -2956,8 +2982,13 @@ class TorchTitanPlugin:
                 "parallelism": {
                     "tp_size": self.tp_degree,
                     "pp_size": self.pp_degree,
+                    "cp_size": self.cp_degree,
                     "dp_size": self.dp_degree,
                     "enable_fsdp": self.enable_fsdp,
+                },
+                "experimental": {
+                    "context_parallel_degree": self.cp_degree,
+                    "context_parallel_rotate_method": self.context_parallel_rotate_method,
                 },
             }
         elif isinstance(self.job_config, dict):
@@ -2968,8 +2999,18 @@ class TorchTitanPlugin:
                 {
                     "tp_size": self.tp_degree,
                     "pp_size": self.pp_degree,
+                    "cp_size": self.cp_degree,
                     "dp_size": self.dp_degree,
                     "enable_fsdp": self.enable_fsdp,
+                }
+            )
+            # Update experimental config for Context Parallel
+            if "experimental" not in self.job_config:
+                self.job_config["experimental"] = {}
+            self.job_config["experimental"].update(
+                {
+                    "context_parallel_degree": self.cp_degree,
+                    "context_parallel_rotate_method": self.context_parallel_rotate_method,
                 }
             )
 
@@ -2990,10 +3031,10 @@ class TorchTitanPlugin:
             int: Minimum required world size
         """
         if self.dp_degree and self.dp_degree > 0:
-            return self.tp_degree * self.pp_degree * self.dp_degree
+            return self.tp_degree * self.pp_degree * self.cp_degree * self.dp_degree
         else:
-            # If dp_degree is auto (None or 0), just return tp * pp
-            return self.tp_degree * self.pp_degree
+            # If dp_degree is auto (None or 0), just return tp * pp * cp
+            return self.tp_degree * self.pp_degree * self.cp_degree
 
     def validate_world_size(self, world_size: int) -> None:
         """
@@ -3007,22 +3048,40 @@ class TorchTitanPlugin:
         """
         min_required = self.get_world_size_requirements()
         if self.dp_degree and self.dp_degree > 0:
-            # Exact world size requirement
+            # Fixed dp_degree - world size must match exactly
             if world_size != min_required:
                 raise ValueError(
                     f"World size {world_size} does not match required size {min_required} "
-                    f"(tp_degree={self.tp_degree} * pp_degree={self.pp_degree} * dp_degree={self.dp_degree})"
+                    f"(tp_degree={self.tp_degree} * pp_degree={self.pp_degree} * cp_degree={self.cp_degree} * dp_degree={self.dp_degree})"
                 )
         else:
-            # Auto dp_degree - world size must be divisible by tp * pp
+            # Auto dp_degree - world size must be divisible by tp * pp * cp
             if world_size % min_required != 0:
                 raise ValueError(
-                    f"World size {world_size} must be divisible by tp_degree * pp_degree = {min_required}"
+                    f"World size {world_size} must be divisible by tp_degree * pp_degree * cp_degree = {min_required}"
                 )
             # Auto-calculate dp_degree
             self.dp_degree = world_size // min_required
             if isinstance(self.job_config, dict) and "parallelism" in self.job_config:
                 self.job_config["parallelism"]["dp_size"] = self.dp_degree
+
+    def get_context_parallel_config(self) -> dict:
+        """
+        Get Context Parallel configuration dictionary.
+
+        Returns:
+            dict: Context Parallel configuration
+        """
+        if self.cp_degree <= 1:
+            return {}
+
+        config = {
+            "cp_degree": self.cp_degree,
+            "rotate_method": self.context_parallel_rotate_method,
+            "seq_dim": self.context_parallel_seq_dim,
+        }
+
+        return config
 
     def get_fsdp_config(self) -> dict:
         """
@@ -3061,7 +3120,7 @@ class TorchTitanPlugin:
 
         return config
 
-    def get_device_mesh_config(self, world_size: int) -> tuple[int, int, int]:
+    def get_device_mesh_config(self, world_size: int) -> tuple[int, int, int, int]:
         """
         Get device mesh configuration for multi-dimensional parallelism.
 
@@ -3069,10 +3128,10 @@ class TorchTitanPlugin:
             world_size (int): Total number of processes
 
         Returns:
-            tuple: (dp_size, tp_size, pp_size)
+            tuple: (dp_size, tp_size, pp_size, cp_size)
         """
         self.validate_world_size(world_size)
-        return (self.dp_degree, self.tp_degree, self.pp_degree)
+        return (self.dp_degree, self.tp_degree, self.pp_degree, self.cp_degree)
 
 
 def get_module_class_from_name(module, name):
