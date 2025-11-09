@@ -97,7 +97,11 @@ These are classes which can be configured and passed through to the appropriate 
 
 [[autodoc]] utils.DataLoaderConfiguration
 
+[[autodoc]] utils.ParallelismConfig
+
 [[autodoc]] utils.ProjectConfiguration
+
+[[autodoc]] utils.TorchContextParallelConfig
 
 ## Environmental Variables
 

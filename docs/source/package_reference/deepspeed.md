@@ -42,3 +42,9 @@ rendered properly in your Markdown viewer.
 [[autodoc]] utils.deepspeed.DummyOptim
 
 ## DummyScheduler
+
+[[autodoc]] utils.deepspeed.DummyScheduler
+
+## DeepSpeedContextParallelConfig
+
+[[autodoc]] utils.dataclasses.DeepSpeedContextParallelConfig
